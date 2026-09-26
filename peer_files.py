@@ -688,6 +688,55 @@ class FileReplicator:
         self.download_rate = DEFAULT_MAX_DOWNLOAD_RATE
         self.rate_source = None
         self.pace_until = 0.0
+        # A long (rate-limited) download must not freeze the rest of replication for its duration.
+        self.next_housekeeping = time.monotonic() + SYNC_INTERVAL_SECONDS
+        self.in_housekeeping = False
+
+    def replication_peers(self) -> list:
+        with self.node.peers_lock:
+            return [peer for peer, record in self.node.profiles.items()
+                    if peer in self.node.confirmed and record["expires_at"] > time.monotonic()
+                    and "file-replication" in record["profile"]["capabilities"]]
+
+    def fetch_markers(self, peers: list) -> None:
+        """Download delete markers (tiny) from each peer and apply them, without other files."""
+        fetched = False
+        for peer in peers:
+            if self.node.stop_event.is_set():
+                return
+            try:
+                for item in self.remote_manifest(peer):
+                    if (marker_target(item["path"]) is None or item["size"] > self.store.max_file_bytes or
+                            self.store.has_copy(item) or self.store.blocked(item)):
+                        continue
+                    try:
+                        self.download(peer, item)
+                        fetched = True
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        self.log(f"could not replicate {item['path']} from {peer.address()}: {error}")
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                self.log(f"marker check with {peer.address()} failed: {error}")
+        if fetched:
+            self.store.apply_markers()
+
+    def housekeeping(self, item: dict) -> None:
+        """Between chunks of a long download, about once per sync interval: rescan local files
+        (imports, renames, markers), pick up new markers from peers and the current rate limit,
+        and abandon the download if a marker now deletes the file being fetched."""
+        if self.in_housekeeping or time.monotonic() < self.next_housekeeping:
+            return
+        self.in_housekeeping = True
+        try:
+            self.store.scan()
+            self.refresh_rate()
+            self.fetch_markers(self.replication_peers())
+        except (OSError, ValueError) as error:
+            self.log(f"housekeeping during download failed: {error}")
+        finally:
+            self.in_housekeeping = False
+            self.next_housekeeping = time.monotonic() + SYNC_INTERVAL_SECONDS
+        if self.store.blocked(item):
+            raise ValueError("removed by a .delete marker while downloading")
 
     def refresh_rate(self) -> None:
         rate, source = self.store.download_rate()
@@ -787,6 +836,8 @@ class FileReplicator:
                     sha.update(data)
                     offset += len(data)
                     self.pace(len(data))
+                    if offset < item["size"]:
+                        self.housekeeping(item)
                 output.flush()
                 os.fsync(output.fileno())
             if sha.hexdigest() != item["sha256"]:
@@ -802,10 +853,8 @@ class FileReplicator:
         try:
             self.store.scan()
             self.refresh_rate()
-            with self.node.peers_lock:
-                peers = [peer for peer, record in self.node.profiles.items()
-                         if peer in self.node.confirmed and record["expires_at"] > time.monotonic()
-                         and "file-replication" in record["profile"]["capabilities"]]
+            self.next_housekeeping = time.monotonic() + SYNC_INTERVAL_SECONDS
+            peers = self.replication_peers()
             self.manifests = {peer: cached for peer, cached in self.manifests.items() if peer in peers}
             for peer in peers:
                 if self.node.stop_event.is_set():

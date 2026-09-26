@@ -521,7 +521,8 @@ class FileReplicationTests(unittest.TestCase):
         item = self.right.file_store.manifest()['files'][0]
         replicator = self.left.file_replicator
         replicator.download_rate = f.CHUNK_BYTES  # one chunk per second
-        clock = [1000.0]
+        replicator.next_housekeeping = float('inf')  # this test is about pacing only
+        clock = [time.monotonic()]  # simulated, but starting from the real reading
         waits = []
 
         def wait(seconds):  # a simulated clock: waiting advances it
@@ -543,6 +544,86 @@ class FileReplicationTests(unittest.TestCase):
             replicator.pace(f.CHUNK_BYTES)
             replicator.pace(f.CHUNK_BYTES)
         self.assertEqual(waits, [1.0, 1.0])
+
+    def long_download(self, on_chunk=None, others=()):
+        """Download a 10-chunk file from right at 2 chunks/s (set through limits.json, which
+        housekeeping re-reads) on a simulated clock, with a 2s sync interval.
+        Returns (outcome, chunk offsets served, simulated times of scans on left, content)."""
+        content = os.urandom(10 * f.CHUNK_BYTES)
+        (self.right.file_store.root / 'big.bin').write_bytes(content)
+        self.right.file_store.scan()
+        item = next(i for i in self.right.file_store.manifest()['files'] if i['path'] == 'big.bin')
+        (self.left.file_store.root / '.peer-sync/limits.json').write_text(
+            json.dumps({'max_download_bytes_per_second': 2 * f.CHUNK_BYTES}))
+        replicator = self.left.file_replicator
+        replicator.refresh_rate()
+        # Simulated, but starting from the real reading: peers' last-seen times use the real clock.
+        start = time.monotonic()
+        clock = [start]
+        chunks, scans = [], []
+        real_scan = self.left.file_store.scan
+
+        def wait(seconds):
+            clock[0] += seconds
+            return False
+
+        def serve(peer, message):
+            other = next((node for node in others if node.identity == peer), None)
+            if other is not None:
+                return other.handle_message(message, source_host='127.0.0.1')
+            reply = self.serve_right(peer, message)
+            if message['type'] == 'file-chunk':
+                chunks.append(message['offset'])
+                if on_chunk:
+                    on_chunk(len(chunks))
+            return reply
+
+        def counting_scan():
+            scans.append(round(clock[0] - start, 6))  # seconds into the download
+            return real_scan()
+
+        with patch.object(f, 'SYNC_INTERVAL_SECONDS', 2), \
+             patch.object(f.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(self.left.stop_event, 'wait', side_effect=wait), \
+             patch.object(self.left.file_store, 'scan', side_effect=counting_scan), \
+             patch.object(self.left, 'exchange', side_effect=serve):
+            replicator.next_housekeeping = clock[0] + f.SYNC_INTERVAL_SECONDS
+            try:
+                replicator.download(self.right.identity, item)
+                outcome = 'installed'
+            except ValueError as error:
+                outcome = str(error)
+        return outcome, chunks, scans, content
+
+    def test_long_download_keeps_housekeeping_on_schedule(self):
+        outcome, chunks, scans, content = self.long_download()
+        self.assertEqual(outcome, 'installed')
+        self.assertEqual(len(chunks), 10)
+        self.assertEqual(scans, [2.0, 4.0])  # once per 2s interval, not per chunk
+        self.assertEqual((self.left.file_store.root / 'big.bin').read_bytes(), content)
+
+    def test_marker_arriving_during_a_long_download_stops_it_and_local_files_are_picked_up(self):
+        # The marker is created on another node; the source has not seen it and keeps serving.
+        third = m.PeerNode('127.0.0.1', 9103, None, shared_dir=self.root / 'third')
+        try:
+            self.left.handle_message(third.message())
+
+            def midway(served):
+                if served == 2:
+                    (third.file_store.root / 'big.bin.delete').touch()
+                    third.file_store.scan()
+                    (self.left.file_store.root / 'added-meanwhile.txt').write_bytes(b'new local file')
+
+            outcome, chunks, scans, _ = self.long_download(on_chunk=midway, others=(third,))
+        finally:
+            third.file_store.close()  # Before tearDown removes the directory (Windows locks).
+        self.assertTrue((self.right.file_store.root / 'big.bin').exists())  # source never saw it
+        self.assertEqual(outcome, 'removed by a .delete marker while downloading')
+        self.assertEqual(len(chunks), 4)  # stopped at the first housekeeping after the marker
+        self.assertFalse((self.left.file_store.root / 'big.bin').exists())
+        self.assertIsNotNone(f.marker_created((self.left.file_store.root / 'big.bin.delete').read_bytes()))
+        self.assertIn('added-meanwhile.txt', self.manifest_paths(self.left))
+        self.assertEqual(list(self.left.file_store.temp.iterdir()), [])
 
     def test_unlimited_rate_never_waits_and_shutdown_interrupts_pacing(self):
         replicator = self.left.file_replicator
