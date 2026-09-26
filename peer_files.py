@@ -581,6 +581,8 @@ class FileReplicator:
         self.node, self.store, self.log = node, store, log
         store.log = log
         self.sync_lock = threading.Lock()
+        # Last complete manifest fetched from each peer, keyed by peer: (generation, files).
+        self.manifests: dict = {}
 
     def request(self, peer, kind: str, **fields) -> dict:
         request = self.node.message(kind)
@@ -602,7 +604,13 @@ class FileReplicator:
                 raise InterruptedError("replication stopped")
             response = self.request(peer, "file-manifest", after=after, generation=generation)
             current = digest(response.get("generation"))
-            if generation is not None and generation != current:
+            if generation is None:
+                # The generation hashes the peer's whole manifest: if it matches the last complete
+                # fetch, the list is identical, so skip the remaining pages and reuse it.
+                cached = self.manifests.get(peer)
+                if cached is not None and cached[0] == current:
+                    return list(cached[1])
+            elif generation != current:
                 raise ValueError("manifest changed")
             generation = current
             page = response.get("files")
@@ -618,7 +626,8 @@ class FileReplicator:
                 raise ValueError("manifest exceeds file limit")
             next_after = response.get("next_after")
             if next_after is None:
-                return files
+                self.manifests[peer] = (generation, files)
+                return list(files)
             if not parsed or next_after != after:
                 raise ValueError("invalid manifest continuation")
 
@@ -667,6 +676,7 @@ class FileReplicator:
                 peers = [peer for peer, record in self.node.profiles.items()
                          if peer in self.node.confirmed and record["expires_at"] > time.monotonic()
                          and "file-replication" in record["profile"]["capabilities"]]
+            self.manifests = {peer: cached for peer, cached in self.manifests.items() if peer in peers}
             for peer in peers:
                 if self.node.stop_event.is_set():
                     return

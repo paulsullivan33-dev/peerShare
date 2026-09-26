@@ -186,6 +186,42 @@ class FileReplicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.right.file_store.manifest(page['next_after'], page['generation'])
 
+    def test_unchanged_remote_manifest_is_fetched_as_one_page_and_repairs_still_happen(self):
+        for number in range(70):  # three manifest pages
+            (self.right.file_store.root / f'{number:03}.txt').write_text(str(number))
+        self.right.file_store.scan()
+        requests = []
+
+        def counting(peer, message):
+            requests.append(message['type'])
+            return self.serve_right(peer, message)
+
+        def sync_counting():
+            requests.clear()
+            with patch.object(self.left, 'exchange', side_effect=counting):
+                self.left.file_replicator.sync_once()
+            return requests.count('file-manifest')
+
+        # At most MAX_DOWNLOADS_PER_PASS files per peer per pass: later passes reuse the
+        # remembered manifest (one page each) while the downloads continue.
+        self.assertEqual(sync_counting(), 3)
+        self.assertEqual(len(self.left.file_store.intact), f.MAX_DOWNLOADS_PER_PASS)
+        self.assertEqual(sync_counting(), 1)
+        self.assertEqual(sync_counting(), 1)
+        self.assertEqual(len(self.left.file_store.intact), 70)
+        # Nothing changed on the peer: only the first page is requested, and nothing downloaded.
+        self.assertEqual(sync_counting(), 1)
+        self.assertNotIn('file-chunk', requests)
+        # A local copy that went missing is still repaired from the remembered manifest.
+        (self.left.file_store.root / '042.txt').unlink()
+        self.assertEqual(sync_counting(), 1)
+        self.assertEqual((self.left.file_store.root / '042.txt').read_text(), '42')
+        # A change on the peer changes its generation: the whole manifest is fetched again.
+        (self.right.file_store.root / 'new.txt').write_text('new')
+        self.right.file_store.scan()
+        self.assertEqual(sync_counting(), 3)
+        self.assertEqual((self.left.file_store.root / 'new.txt').read_text(), 'new')
+
     def test_storage_quota_and_oversize_file_do_not_block_smaller_files(self):
         (self.right.file_store.root / 'a-large').write_bytes(b'x' * 20)
         (self.right.file_store.root / 'b-small').write_bytes(b'y' * 4)

@@ -340,19 +340,27 @@ class ReleaseTests(unittest.TestCase):
         runtime.mkdir()
         release.atomic_json(runtime / 'lease.json', {'token': 'test-token'})
         control = RuntimeControl(node, runtime, 1, 'test-token')
+
+        def poll_until_heartbeat_written():
+            # On Windows another process (e.g. antivirus) can briefly deny replacing
+            # health.json; poll() then skips that beat by design, so allow a few polls.
+            for _ in range(5):
+                control.poll()
+                if launch.read_json(runtime / 'health.json')['counter'] == control.counter:
+                    return
+            self.fail('no heartbeat was written in 5 polls')
+
         for content in ('{not json', '"stop"', '[]', '\udcff'):
             with self.subTest(content=content):
                 (runtime / 'control.json').write_text(content, encoding='utf-8', errors='surrogateescape')
-                control.poll()
+                poll_until_heartbeat_written()
                 self.assertFalse(node.stop_event.is_set())
-                self.assertEqual(launch.read_json(runtime / 'health.json')['counter'], control.counter)
         # Windows refuses to replace health.json while the launcher has it open for reading.
         with patch('peer_runtime.os.replace', side_effect=PermissionError(5, 'Access is denied')):
             control.poll()
         self.assertFalse(node.stop_event.is_set())
         self.assertEqual([path.name for path in runtime.glob('*.tmp')], [])
-        control.poll()
-        self.assertEqual(launch.read_json(runtime / 'health.json')['counter'], control.counter)
+        poll_until_heartbeat_written()
         release.atomic_json(runtime / 'control.json', {'command': 'stop', 'token': 'test-token'})
         control.poll()
         self.assertTrue(node.stop_event.is_set())
