@@ -115,6 +115,31 @@ class ValidationAndRetryTests(unittest.TestCase):
             self.node.handle_message(self.greeting)
             self.assertTrue(self.node.retry_queue.empty())
 
+    def test_unreachable_peer_does_not_hold_a_worker_between_attempts(self):
+        dead, live = m.Peer('127.0.0.1', 9103), m.Peer('127.0.0.1', 9104)
+        with patch.object(m.threading, 'Thread'), \
+             patch.object(m.time, 'monotonic', return_value=100) as clock, \
+             patch.object(self.node.stop_event, 'wait', side_effect=AssertionError('worker slept')), \
+             patch.object(self.node, 'send_hello', side_effect=lambda peer, reason: peer == live) as send:
+            for peer in (dead, live):
+                self.node.add_peer(peer)
+                self.node.retry_peer(peer)
+            self.node.retry_queue.get_nowait()()  # dead peer: first attempt fails and returns
+            self.assertIn(dead, self.node.retrying)
+            self.node.retry_queue.get_nowait()()  # the live peer is not stuck behind it
+            self.assertIn(live, self.node.confirmed)
+            for attempt in range(2, m.MAX_RETRIES + 1):
+                self.assertTrue(self.node.retry_queue.empty())
+                self.node.release_due_retries()
+                self.assertTrue(self.node.retry_queue.empty(), 'retry released before its delay')
+                clock.return_value += m.RETRY_DELAY_SECONDS
+                self.node.release_due_retries()
+                self.node.retry_queue.get_nowait()()
+            self.assertEqual([call.args[0] for call in send.call_args_list].count(dead), m.MAX_RETRIES)
+            self.assertNotIn(dead, self.node.retrying)
+            self.assertEqual(self.node.retry_after[dead], clock.return_value + m.RETRY_COOLDOWN_SECONDS)
+            self.assertEqual(self.node.retry_schedule, [])
+
     def test_incoming_handshake_cancels_queued_retry(self):
         peer = m.Peer('127.0.0.1', 9103)
         with patch.object(m.threading, 'Thread'), patch.object(self.node, 'send_hello') as send:

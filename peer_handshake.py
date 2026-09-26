@@ -2,6 +2,8 @@
 """Small peer-to-peer handshake service."""
 
 import argparse
+import heapq
+import itertools
 import json
 import ipaddress
 import queue
@@ -123,6 +125,9 @@ class PeerNode:
         self.last_seen: dict[Peer, float] = {}
         self.last_probe: dict[Peer, float] = {}
         self.retrying: set[Peer] = set()
+        # Heap of (due time, sequence, peer, force, started, attempt) for delayed retry attempts.
+        self.retry_schedule: list[tuple] = []
+        self.retry_sequence = itertools.count()
         self.inbound_slots = threading.BoundedSemaphore(MAX_INBOUND_CONNECTIONS)
         self.retry_queue = queue.Queue(maxsize=MAX_PEERS)
         self.retry_workers_started = False
@@ -357,7 +362,7 @@ class PeerNode:
     def retry_worker(self) -> None:
         while not self.stop_event.is_set():
             try:
-                job = self.retry_queue.get(timeout=1)
+                job = self.retry_queue.get(timeout=self.release_due_retries())
             except queue.Empty:
                 continue
             try:
@@ -391,36 +396,63 @@ class PeerNode:
             self.retrying.add(peer)
             self.last_probe[peer] = time.monotonic()
             started = self.last_probe[peer]
-
-        def retry() -> None:
-            try:
-                for attempt in range(1, MAX_RETRIES + 1):
-                    if self.stop_event.is_set():
-                        return
-                    with self.retrying_lock:
-                        if peer not in self.peers or (peer in self.confirmed and not force):
-                            return
-                    if self.send_hello(peer, f"retry {attempt}/{MAX_RETRIES}"):
-                        self.confirm_peer(peer)
-                        return
-                    if attempt < MAX_RETRIES:
-                        if self.stop_event.wait(RETRY_DELAY_SECONDS):
-                            return
-                with self.peers_lock:
-                    if self.last_seen.get(peer, 0) <= started:
-                        self.confirmed.discard(peer)
-                log(f"giving up on {peer.address()} after {MAX_RETRIES} attempts")
-            finally:
-                with self.retrying_lock:
-                    self.retrying.discard(peer)
-                    if peer in self.peers and peer not in self.confirmed:
-                        self.retry_after[peer] = time.monotonic() + RETRY_COOLDOWN_SECONDS
-
         try:
-            self.retry_queue.put_nowait(retry)
+            self.retry_queue.put_nowait(lambda: self.retry_attempt(peer, force, started, 1))
         except queue.Full:
             with self.retrying_lock:
                 self.retrying.discard(peer)
+
+    def retry_attempt(self, peer: Peer, force: bool, started: float, attempt: int) -> None:
+        # Each job is one attempt, so an unreachable peer never holds a worker between attempts.
+        finished = True
+        try:
+            if self.stop_event.is_set():
+                return
+            with self.retrying_lock:
+                if peer not in self.peers or (peer in self.confirmed and not force):
+                    return
+            if self.send_hello(peer, f"retry {attempt}/{MAX_RETRIES}"):
+                self.confirm_peer(peer)
+                return
+            if attempt < MAX_RETRIES:
+                with self.retrying_lock:
+                    heapq.heappush(self.retry_schedule, (time.monotonic() + RETRY_DELAY_SECONDS,
+                                                         next(self.retry_sequence), peer, force,
+                                                         started, attempt + 1))
+                finished = False
+                return
+            with self.peers_lock:
+                if self.last_seen.get(peer, 0) <= started:
+                    self.confirmed.discard(peer)
+            log(f"giving up on {peer.address()} after {MAX_RETRIES} attempts")
+        finally:
+            if finished:
+                self.finish_retry(peer)
+
+    def finish_retry(self, peer: Peer) -> None:
+        with self.retrying_lock:
+            self.retrying.discard(peer)
+            if peer in self.peers and peer not in self.confirmed:
+                self.retry_after[peer] = time.monotonic() + RETRY_COOLDOWN_SECONDS
+
+    def release_due_retries(self) -> float:
+        """Queue delayed attempts that are due, behind already-queued probes.
+
+        Returns how long a worker may wait for work before checking again."""
+        now = time.monotonic()
+        due = []
+        with self.retrying_lock:
+            while self.retry_schedule and self.retry_schedule[0][0] <= now:
+                due.append(heapq.heappop(self.retry_schedule))
+            wait = self.retry_schedule[0][0] - now if self.retry_schedule else 1
+        for _, _, peer, force, started, attempt in due:
+            try:
+                self.retry_queue.put_nowait(
+                    lambda peer=peer, force=force, started=started, attempt=attempt:
+                    self.retry_attempt(peer, force, started, attempt))
+            except queue.Full:
+                self.finish_retry(peer)
+        return min(1, max(wait, 0.01))
 
     def handle_message(self, message: object, source_host: str | None = None,
                        expected_peer: Peer | None = None) -> dict:

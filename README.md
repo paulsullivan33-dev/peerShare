@@ -27,7 +27,7 @@ This is a trusted-network service: range restrictions are not authentication or 
 
 ## Discovery and health
 
-A maintenance pass runs every 5 seconds, scheduling peer-list exchanges when at least 30 seconds have elapsed since the last scheduled probe. Work uses the same bounded retry queue as initial discovery. Confirmations expire after 90 seconds without direct contact. Failed retry batches wait 60 seconds before another attempt; maintenance retries automatically without requiring another advertisement.
+A maintenance pass runs every 5 seconds, scheduling peer-list exchanges when at least 30 seconds have elapsed since the last scheduled probe. Work uses the same bounded retry queue as initial discovery. Confirmations expire after 90 seconds without direct contact. Failed retry batches wait 60 seconds before another attempt; maintenance retries automatically without requiring another advertisement. Each queued job is a single connection attempt: a failed attempt waits its 2-second retry delay outside the worker pool and then rejoins the back of the queue, so unreachable peers cannot tie up workers or delay probes of healthy peers.
 
 Peers with no direct contact for 5 minutes are removed, freeing capacity and deleting their health/retry metadata. Active or queued retries finish before their peer can be removed. Third-party advertisements do not refresh this lifetime. Only confirmed peers and this node's identity appear in outgoing peer lists. An expired peer can be rediscovered later; an isolated node with an empty peer list needs a new connection to rejoin.
 
