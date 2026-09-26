@@ -235,6 +235,22 @@ class FileReplicationTests(unittest.TestCase):
         self.assertTrue(lock_free and all(lock_free))
         self.assertEqual([item['path'] for item in store.manifest()['files']], ['keep.bin'])
 
+    def test_unexpected_error_does_not_stop_replication_thread(self):
+        replicator = self.left.file_replicator
+        calls = []
+
+        def sync_once():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RecursionError('maximum recursion depth exceeded')
+            self.left.stop_event.set()
+
+        with patch.object(replicator, 'sync_once', side_effect=sync_once), \
+             patch.object(f, 'SYNC_INTERVAL_SECONDS', 0), patch.object(replicator, 'log') as log:
+            replicator.run()
+        self.assertEqual(len(calls), 2)
+        self.assertIn('RecursionError', log.call_args_list[0].args[0])
+
     def test_file_directory_collision_preserves_both(self):
         (self.left.file_store.root / 'folder').write_bytes(b'local file')
         (self.right.file_store.root / 'folder').mkdir()

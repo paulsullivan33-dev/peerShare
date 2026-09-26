@@ -530,7 +530,8 @@ class FileReplicator:
         while not self.node.stop_event.is_set():
             try:
                 self.sync_once()
-            except (OSError, ValueError) as error:
-                self.log(f"file scan failed: {error}")
+            except Exception as error:
+                # Never let one bad pass (or peer reply) stop replication for the node's lifetime.
+                self.log(f"file sync pass failed: {error!r}")
             if self.node.stop_event.wait(SYNC_INTERVAL_SECONDS):
                 return

@@ -24,6 +24,13 @@ class ResourceTests(unittest.TestCase):
                     with self.assertRaises((ValueError, TimeoutError)):
                         m.read_message(b)
 
+    def test_deeply_nested_message_is_rejected_as_invalid(self):
+        a, b = socket.socketpair()
+        with a, b:
+            a.sendall(b'[' * 60000 + b'\n')
+            with self.assertRaisesRegex(ValueError, 'nesting'):
+                m.read_message(b)
+
     def test_handshake_and_slot_release(self):
         node = m.PeerNode('127.0.0.1', 9101, None)
         a, b = socket.socketpair()

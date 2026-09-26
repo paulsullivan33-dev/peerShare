@@ -59,7 +59,11 @@ def read_message(connection: socket.socket) -> object:
         if newline >= 0:
             if newline + 1 > MAX_MESSAGE_BYTES:
                 raise ValueError("message too large")
-            return json.loads(data[:newline].decode("utf-8"))
+            try:
+                return json.loads(data[:newline].decode("utf-8"))
+            except RecursionError as error:
+                # Deeply nested JSON fits within the size limit but exhausts the parser's stack.
+                raise ValueError("message nesting too deep") from error
         if len(data) >= MAX_MESSAGE_BYTES:
             raise ValueError("message too large")
 
