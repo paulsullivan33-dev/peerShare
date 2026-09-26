@@ -115,13 +115,30 @@ Nested directories, binary data, and zero-byte files are supported. For importin
 - A manifest entry contains a relative path, byte length, and SHA-256 hash. Both size and hash must match before a copy is considered intact.
 - Each scan rehashes only tracked files whose size, timestamps, or file ID changed since they last verified. Every tracked file is fully rehashed once after startup and then hourly, so damage that leaves file metadata unchanged is detected within that interval. Hashing does not block peers' manifest or chunk requests.
 - File versions are immutable after initial indexing. A changed tracked file is treated as damaged and repaired from a peer. Publish an intentional edit under a new filename. Replication does not decide which edits are newer.
-- A deleted local copy is restored when another peer advertises it. Deletions are not propagated.
+- A deleted local copy is restored when another peer advertises it: simply deleting a file does not propagate. To delete a file or folder on every node, use a delete marker (below).
 - Different contents at the same logical path are both preserved. The original local file stays in place; additional versions appear under `replica-conflicts/HASH/PATH-ID/original/path`. Nodes may retain different versions at the primary pathname, but their manifests converge on all versions. Conflict copies retain their original logical identity rather than recursively creating new filenames in manifests.
 - Expected hashes and destination mappings persist in `.peer-sync/index.json`. Keep this index to detect corruption after a restart. If the index is invalid, startup fails rather than silently discarding it.
 - Downloads are written to private `.peer-sync/tmp/*.part` files, fully hashed, and atomically installed only when intact. Failed/interrupted transfers leave no advertised partial file; they retry from the beginning on a later pass. Orphaned transfer files are removed at next startup. On Linux, a downloaded file's permissions are explicitly set to world-read/write (`rw-rw-rw-`) once installed; while downloading and being verified it stays owner-only (`rw-------`), so other users cannot alter it before its hash is checked — unlike the application's own code, keys, and local state, which keep the OS's normal (owner-restricted) defaults.
 - When repairing changed bytes, the old bytes are preserved under `.peer-sync/quarantine` before replacement. These backups are local and are never replicated. Review/remove them manually when no longer needed; replication never silently purges them.
 
 If every copy of a version is lost or corrupted, its expected hash can detect the loss but cannot reconstruct its contents. This is replication, not an independent backup or authenticity guarantee.
+
+### Deleting files on every node
+
+Create an **empty** file named after the file or folder plus `.delete`, in any node's shared directory:
+
+```sh
+touch shared/reports/q3.pdf.delete    # deletes reports/q3.pdf everywhere
+touch shared/old-photos.delete        # deletes the folder old-photos/ and everything in it
+```
+
+- Within one scan (about 15 seconds) the node writes a small creation timestamp into the empty file, making it a delete marker. The marker replicates like any other file.
+- While a marker is active, every node permanently deletes all versions of its target, including conflict copies under `replica-conflicts`, and removes folders left empty. Nodes will not download the target from peers that have not seen the marker yet, and a file recreated at that path is deleted again. Deleted bytes are not kept anywhere; this cannot be undone.
+- A folder marker covers everything below that folder (`old-photos.delete` deletes `old-photos/...` but not `old-photos-2024/`). Markers cannot target the shared directory itself.
+- **Expiry:** 30 days after its creation time, every node removes the marker and remembers it as retired, so a peer still holding it cannot restart it. The name can then be used again. A node that was offline for the whole 30 days still has the old files and will replicate them back when it reconnects.
+- Only empty `.delete` files become markers. A `.delete` file that already has content is an ordinary shared file, and so is an empty file named just `.delete`.
+- Anyone who can write to any node's shared directory can delete files on every node this way; restrict access accordingly.
+- Files a node never shares (for example over the size limit, or hard-linked) are not affected by markers.
 
 ### Transfer protocol and limits
 

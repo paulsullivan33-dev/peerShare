@@ -28,6 +28,16 @@ MAX_DOWNLOADS_PER_PASS = 32
 REQUEST_TYPES = ("file-manifest", "file-chunk")
 RESPONSE_TYPES = ("file-manifest-result", "file-chunk-result", "file-error")
 RESERVED = {".peer-sync", "replica-conflicts"}
+# An empty file "PATH.delete" is stamped with its creation time and replicated; while active,
+# every node deletes all versions of PATH (a file, or everything under a folder) and refuses to
+# download or import them again. It expires MARKER_TTL_SECONDS after creation, measured from the
+# stamp so all nodes agree; then each node removes it and remembers it as retired. A node offline
+# for longer than that can reintroduce the deleted files.
+DELETE_SUFFIX = ".delete"
+MARKER_TTL_SECONDS = 30 * 86400
+MAX_MARKER_BYTES = 512
+MAX_RETIRED_MARKERS = 10000
+MARKER_FIELDS = {"peerhandshake-delete", "created", "id"}
 
 
 def logical_path(value: object) -> str:
@@ -60,6 +70,41 @@ def entry(value: object, max_file_bytes: int) -> dict:
 
 def key(item: dict) -> str:
     return item["path"] + "\0" + item["sha256"]
+
+
+def marker_target(path: str) -> str | None:
+    """The logical path a PATH.delete marker removes, or None if it cannot be a marker."""
+    if not path.endswith(DELETE_SUFFIX):
+        return None
+    try:
+        return logical_path(path[:-len(DELETE_SUFFIX)])
+    except ValueError:
+        return None  # e.g. "folder/.delete": would target a folder's root or an invalid path
+
+
+def covers(target: str, path: str) -> bool:
+    return path == target or path.startswith(target + "/")
+
+
+def marker_bytes(created: int) -> bytes:
+    return (json.dumps({"peerhandshake-delete": 1, "created": created, "id": str(uuid.uuid4())},
+                       sort_keys=True) + "\n").encode()
+
+
+def marker_created(data: bytes) -> int | None:
+    """Creation time stamped in a marker, or None when the bytes are not a stamped marker."""
+    if len(data) > MAX_MARKER_BYTES:
+        return None
+    try:
+        value = json.loads(data.decode("utf-8"))
+        if (not isinstance(value, dict) or set(value) != MARKER_FIELDS or
+                value["peerhandshake-delete"] != 1 or type(value["created"]) is not int or
+                value["created"] <= 0 or not isinstance(value["id"], str)):
+            return None
+        uuid.UUID(value["id"])
+    except ValueError:
+        return None
+    return value["created"]
 
 
 def is_link(info: os.stat_result) -> bool:
@@ -118,6 +163,13 @@ class FileStore:
         # Stat signature of each record's destination when its bytes last hashed correctly.
         self.verified: dict[str, tuple] = {}
         self.last_full_verify = float("-inf")
+        # Delete markers: expired marker versions never to download again (oldest first), the
+        # targets of currently active markers, and each marker record's parsed creation time
+        # (0 for a file that merely ends in .delete but is not a stamped marker).
+        self.retired_markers: dict[str, None] = {}
+        self.deleting: tuple[str, ...] = ()
+        self.marker_times: dict[str, int] = {}
+        self.log = lambda message: None
         if self.index_path.exists():
             raw = json.loads(self.index_path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("files"), list):
@@ -138,6 +190,16 @@ class FileStore:
                     raise ValueError("duplicate entry in replication index")
                 destinations.add(destination.casefold())
                 self.records[key(item)] = {"file": item, "destination": destination}
+            retired = raw.get("retired_markers", [])  # Absent in indexes written before markers.
+            if not isinstance(retired, list) or len(retired) > MAX_RETIRED_MARKERS:
+                raise ValueError("invalid replication index; refusing to replace it")
+            for identifier in retired:
+                if not isinstance(identifier, str) or identifier.count("\0") != 1:
+                    raise ValueError("invalid replication index; refusing to replace it")
+                path, sha = identifier.split("\0")
+                logical_path(path)
+                digest(sha)
+                self.retired_markers[identifier] = None
 
         owner_path = self.safe_path(".peer-sync/owner.lock", internal=True)
         owner = owner_path.open("a+b")
@@ -212,7 +274,8 @@ class FileStore:
         temporary = self.safe_path(".peer-sync/" + uuid.uuid4().hex + ".index", internal=True)
         try:
             with temporary.open("x", encoding="utf-8") as output:
-                json.dump({"version": 1, "files": list(self.records.values())}, output)
+                json.dump({"version": 1, "files": list(self.records.values()),
+                           "retired_markers": list(self.retired_markers)}, output)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, self.index_path)
@@ -278,6 +341,8 @@ class FileStore:
                     continue
                 try:
                     path = self.safe_path(relative)
+                    if marker_target(relative) is not None and path.lstat().st_size == 0:
+                        self.stamp_marker(path)
                     before = self.signature(path)
                     sha, size = fingerprint(path, self.max_file_bytes)
                 except (OSError, ValueError):
@@ -300,6 +365,93 @@ class FileStore:
                 changed = True
             if changed:
                 self.save()
+        self.apply_markers()
+
+    def stamp_marker(self, path: Path) -> None:
+        """Give a newly created, empty PATH.delete its creation time and a unique ID, so all
+        nodes expire it at the same moment and each new marker is a distinct version."""
+        temporary = self.safe_path(".peer-sync/tmp/" + uuid.uuid4().hex + ".part", internal=True)
+        try:
+            with temporary.open("xb") as output:
+                output.write(marker_bytes(int(time.time())))
+                output.flush()
+                os.fsync(output.fileno())
+            if path.lstat().st_size != 0:
+                raise ValueError("marker was written to while stamping")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        try:
+            path.chmod(0o666)  # Same access for other local processes as replicated files.
+        except OSError:
+            pass
+
+    def blocked(self, item: dict) -> bool:
+        """True for a version an active marker deletes, or an expired marker already removed."""
+        with self.lock:
+            return (key(item) in self.retired_markers or
+                    any(covers(target, item["path"]) for target in self.deleting))
+
+    def apply_markers(self) -> None:
+        """Delete everything active markers cover and remove markers that have expired."""
+        now = time.time()
+        with self.lock:
+            active, expired = [], []
+            for identifier, record in self.records.items():
+                target = marker_target(record["file"]["path"])
+                if target is None or identifier not in self.intact:
+                    continue
+                if identifier not in self.marker_times:
+                    created = None
+                    if record["file"]["size"] <= MAX_MARKER_BYTES:
+                        try:
+                            created = marker_created(
+                                self.safe_path(record["destination"], internal=True).read_bytes())
+                        except (OSError, ValueError):
+                            continue  # Unreadable right now; try again on the next scan.
+                    self.marker_times[identifier] = created or 0
+                created = self.marker_times[identifier]
+                if not created:
+                    continue  # An ordinary file whose name happens to end in .delete.
+                (expired if now >= created + MARKER_TTL_SECONDS else active).append((identifier, target))
+            self.deleting = tuple(target for _, target in active)
+            removed = []
+            for identifier, _ in expired:
+                self.retired_markers[identifier] = None
+                removed.append((identifier, self.records[identifier], "expired marker"))
+            while len(self.retired_markers) > MAX_RETIRED_MARKERS:
+                del self.retired_markers[next(iter(self.retired_markers))]
+            for identifier, record in self.records.items():
+                if any(covers(target, record["file"]["path"]) for target in self.deleting):
+                    removed.append((identifier, record, "deleted by marker"))
+            if not removed:
+                return
+            for identifier, _, _ in removed:
+                self.records.pop(identifier, None)
+                self.intact.discard(identifier)
+                self.verified.pop(identifier, None)
+                self.marker_times.pop(identifier, None)
+            # Forget the versions first: a crash before unlinking leaves untracked files that
+            # the next scan imports and the still-active marker deletes again.
+            self.save()
+            for _, record, reason in removed:
+                try:
+                    path = self.safe_path(record["destination"], internal=True)
+                    path.unlink(missing_ok=True)
+                    self.remove_empty_parents(path)
+                except (OSError, ValueError) as error:
+                    self.log(f"could not remove {record['destination']}: {error}")
+                    continue
+                self.log(f"{reason}: removed {record['destination']}")
+
+    def remove_empty_parents(self, path: Path) -> None:
+        for parent in path.parents:
+            if parent == self.root or parent == self.state or not parent.is_relative_to(self.root):
+                return
+            try:
+                parent.rmdir()
+            except OSError:
+                return  # Not empty (or gone): stop here.
 
     def manifest(self, after: str = "", generation: str | None = None) -> dict:
         with self.lock:
@@ -367,6 +519,8 @@ class FileStore:
         if fingerprint(temporary, self.max_file_bytes) != (item["sha256"], item["size"]):
             raise ValueError("download failed integrity verification")
         with self.lock:
+            if self.blocked(item):
+                raise ValueError("removed by a .delete marker")
             if not self.can_receive(item):
                 raise ValueError("replication storage limit exceeded")
             record = self.records.get(key(item))
@@ -425,6 +579,7 @@ class FileStore:
 class FileReplicator:
     def __init__(self, node, store: FileStore, log):
         self.node, self.store, self.log = node, store, log
+        store.log = log
         self.sync_lock = threading.Lock()
 
     def request(self, peer, kind: str, **fields) -> dict:
@@ -517,18 +672,27 @@ class FileReplicator:
                     return
                 try:
                     manifest = self.remote_manifest(peer)
+                    # Delete markers first, so this pass never fetches files a marker removes.
+                    markers = [item for item in manifest if marker_target(item["path"]) is not None]
+                    others = [item for item in manifest if marker_target(item["path"]) is None]
                     downloaded = 0
-                    for item in manifest:
-                        if self.node.stop_event.is_set():
-                            return
-                        if item["size"] > self.store.max_file_bytes or self.store.has_copy(item):
-                            continue
-                        try:
-                            self.download(peer, item)
-                        except (OSError, ValueError, TypeError, KeyError) as error:
-                            self.log(f"could not replicate {item['path']} from {peer.address()}: {error}")
-                            continue
-                        downloaded += 1
+                    for batch in (markers, others):
+                        for item in batch:
+                            if self.node.stop_event.is_set():
+                                return
+                            if (item["size"] > self.store.max_file_bytes or self.store.has_copy(item) or
+                                    self.store.blocked(item)):
+                                continue
+                            try:
+                                self.download(peer, item)
+                            except (OSError, ValueError, TypeError, KeyError) as error:
+                                self.log(f"could not replicate {item['path']} from {peer.address()}: {error}")
+                                continue
+                            downloaded += 1
+                            if downloaded >= MAX_DOWNLOADS_PER_PASS:
+                                break
+                        if batch is markers and markers:
+                            self.store.apply_markers()
                         if downloaded >= MAX_DOWNLOADS_PER_PASS:
                             break
                 except (OSError, ValueError, TypeError, KeyError) as error:

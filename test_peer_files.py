@@ -282,6 +282,138 @@ class FileReplicationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'index|file entry'):
                     f.FileStore(directory).close()
 
+    def sync(self, node, *sources):
+        by_port = {source.identity.port: source for source in sources}
+        with patch.object(node, 'exchange', side_effect=lambda peer, message:
+                          by_port[peer.port].handle_message(message, source_host='127.0.0.1')):
+            node.file_replicator.sync_once()
+
+    def manifest_paths(self, node):
+        return sorted(item['path'] for item in node.file_store.manifest()['files'])
+
+    def test_delete_marker_is_stamped_and_removes_the_file_on_every_node(self):
+        (self.right.file_store.root / 'a.txt').write_bytes(b'remove me')
+        (self.right.file_store.root / 'keep.txt').write_bytes(b'keep me')
+        self.right.file_store.scan()
+        self.sync(self.left, self.right)
+        self.assertTrue((self.left.file_store.root / 'a.txt').exists())
+        stale = m.PeerNode('127.0.0.1', 9103, None, shared_dir=self.root / 'stale')
+        try:
+            self.check_marker_removes_file_everywhere(stale)
+        finally:
+            stale.file_store.close()  # Before tearDown removes the directory (Windows locks).
+
+    def check_marker_removes_file_everywhere(self, stale):
+        (stale.file_store.root / 'a.txt').write_bytes(b'remove me')
+        stale.file_store.scan()
+
+        marker = self.right.file_store.root / 'a.txt.delete'
+        marker.touch()
+        self.right.file_store.scan()
+        self.assertIsNotNone(f.marker_created(marker.read_bytes()))  # stamped
+        self.assertFalse((self.right.file_store.root / 'a.txt').exists())
+        self.assertEqual(self.manifest_paths(self.right), ['a.txt.delete', 'keep.txt'])
+
+        self.sync(self.left, self.right)
+        self.assertFalse((self.left.file_store.root / 'a.txt').exists())
+        self.assertEqual((self.left.file_store.root / 'a.txt.delete').read_bytes(), marker.read_bytes())
+        self.assertEqual(self.manifest_paths(self.left), ['a.txt.delete', 'keep.txt'])
+        # A peer that has not seen the marker yet cannot bring the file back...
+        self.left.handle_message(stale.message())
+        self.sync(self.left, self.right, stale)
+        self.assertFalse((self.left.file_store.root / 'a.txt').exists())
+        # ...and neither can someone recreating it locally while the marker is active.
+        (self.left.file_store.root / 'a.txt').write_bytes(b'recreated')
+        self.left.file_store.scan()
+        self.assertFalse((self.left.file_store.root / 'a.txt').exists())
+        self.assertEqual(self.manifest_paths(self.left), ['a.txt.delete', 'keep.txt'])
+
+    def test_folder_marker_removes_everything_under_it_and_the_emptied_folders(self):
+        root = self.right.file_store.root
+        (root / 'photos/sub').mkdir(parents=True)
+        (root / 'photos/x.jpg').write_bytes(b'x')
+        (root / 'photos/sub/y.jpg').write_bytes(b'y')
+        (root / 'photosbook.txt').write_bytes(b'not inside the folder')
+        (root / 'other.txt').write_bytes(b'other')
+        self.right.file_store.scan()
+        (root / 'photos.delete').touch()
+        self.right.file_store.scan()
+        self.assertFalse((root / 'photos').exists())
+        self.assertEqual(self.manifest_paths(self.right), ['other.txt', 'photos.delete', 'photosbook.txt'])
+
+    def test_marker_removes_conflict_copies_too(self):
+        (self.left.file_store.root / 'report.txt').write_bytes(b'left version')
+        (self.right.file_store.root / 'report.txt').write_bytes(b'right version')
+        self.left.file_store.scan()
+        self.right.file_store.scan()
+        self.right.handle_message(self.left.message())
+        self.sync(self.left, self.right)
+        self.sync(self.right, self.left)
+        self.assertEqual(len(self.left.file_store.manifest()['files']), 2)
+        (self.right.file_store.root / 'report.txt.delete').touch()
+        self.right.file_store.scan()
+        self.sync(self.left, self.right)
+        for node in (self.left, self.right):
+            with self.subTest(node=node.identity.port):
+                self.assertEqual(self.manifest_paths(node), ['report.txt.delete'])
+                self.assertFalse((node.file_store.root / 'report.txt').exists())
+                leftovers = [path for path in (node.file_store.root / 'replica-conflicts').rglob('*')
+                             if path.is_file()] if (node.file_store.root / 'replica-conflicts').exists() else []
+                self.assertEqual(leftovers, [])
+
+    def test_marker_expires_everywhere_and_the_name_can_be_reused(self):
+        store = self.right.file_store
+        (store.root / 'a.txt').write_bytes(b'old')
+        (store.root / 'a.txt.delete').touch()
+        store.scan()
+        marker_item = next(item for item in store.manifest()['files'] if item['path'] == 'a.txt.delete')
+        self.assertFalse((store.root / 'a.txt').exists())
+        later = time.time() + f.MARKER_TTL_SECONDS + 1
+        with patch.object(f.time, 'time', return_value=later):
+            store.scan()
+            self.assertFalse((store.root / 'a.txt.delete').exists())
+            self.assertEqual(self.manifest_paths(self.right), [])
+            self.assertTrue(store.blocked(marker_item))  # a peer still offering it is ignored
+            # The name is free again: new content replicates normally.
+            (store.root / 'a.txt').write_bytes(b'new')
+            store.scan()
+            self.sync(self.left, self.right)
+        self.assertEqual((self.left.file_store.root / 'a.txt').read_bytes(), b'new')
+        self.assertFalse((self.left.file_store.root / 'a.txt.delete').exists())
+        store.close()
+        reopened = f.FileStore(store.root)
+        self.right.file_store = reopened
+        self.assertTrue(reopened.blocked(marker_item))  # retirement survives a restart
+
+    def test_ordinary_files_ending_in_delete_are_left_alone(self):
+        root = self.right.file_store.root
+        (root / 'notes').write_bytes(b'notes')
+        (root / 'notes.delete').write_bytes(b'real data, not a marker')
+        (root / 'sub').mkdir()
+        (root / 'sub/.delete').touch()  # would target a folder's root: never a marker
+        self.right.file_store.scan()
+        self.assertEqual((root / 'notes').read_bytes(), b'notes')
+        self.assertEqual((root / 'notes.delete').read_bytes(), b'real data, not a marker')
+        self.assertEqual((root / 'sub/.delete').read_bytes(), b'')
+        self.assertEqual(self.manifest_paths(self.right), ['notes', 'notes.delete', 'sub/.delete'])
+
+    def test_index_without_retired_markers_still_loads_and_bad_ones_are_rejected(self):
+        for retired, valid in (((), True), ([], True), (['a.txt\0' + 'b' * 64], True),
+                               ('nope', False), ([5], False), (['../x\0' + 'b' * 64], False),
+                               (['a.txt'], False)):
+            with self.subTest(retired=retired):
+                directory = self.root / ('index-' + uuid.uuid4().hex)
+                (directory / '.peer-sync').mkdir(parents=True)
+                index = {'version': 1, 'files': []}
+                if retired != ():
+                    index['retired_markers'] = retired
+                (directory / '.peer-sync/index.json').write_text(json.dumps(index))
+                if valid:
+                    f.FileStore(directory).close()
+                else:
+                    with self.assertRaisesRegex(ValueError, 'index|path|digest'):
+                        f.FileStore(directory).close()
+
     def test_unexpected_error_does_not_stop_replication_thread(self):
         replicator = self.left.file_replicator
         calls = []
@@ -356,6 +488,48 @@ class LiveReplicationTests(unittest.TestCase):
                 damaged.write_bytes(b'broken')
                 wait_for(lambda: intact(nodes[1]))
                 self.assertTrue(intact(nodes[2]))
+            finally:
+                for node in nodes:
+                    node.stop_event.set()
+                for thread in threads:
+                    thread.join(16)
+                    self.assertFalse(thread.is_alive())
+
+
+class LiveDeleteMarkerTests(unittest.TestCase):
+    def test_marker_created_on_one_node_deletes_the_file_on_all_live_nodes(self):
+        nodes, threads = [], []
+
+        def wait_for(predicate, timeout=15):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                time.sleep(.025)
+            self.fail('nodes did not converge')
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(f, 'SYNC_INTERVAL_SECONDS', .1):
+            try:
+                for number in range(3):
+                    with socket.socket() as reservation:
+                        reservation.bind(('127.0.0.1', 0))
+                        port = reservation.getsockname()[1]
+                    node = m.PeerNode('127.0.0.1', port, nodes[-1].identity if nodes else None,
+                                      shared_dir=Path(directory) / str(number))
+                    if number == 0:
+                        (node.file_store.root / 'doomed.bin').write_bytes(b'd' * 5000)
+                        (node.file_store.root / 'kept.bin').write_bytes(b'k' * 5000)
+                    nodes.append(node)
+                    threads.append(threading.Thread(target=node.run, daemon=True))
+                    threads[-1].start()
+                has = lambda node, name: (node.file_store.root / name).exists()
+                wait_for(lambda: all(has(node, 'doomed.bin') and has(node, 'kept.bin') for node in nodes))
+                (nodes[2].file_store.root / 'doomed.bin.delete').touch()
+                wait_for(lambda: all(not has(node, 'doomed.bin') and has(node, 'doomed.bin.delete')
+                                     for node in nodes))
+                time.sleep(.5)  # Several more sync passes: nothing may bring it back.
+                self.assertFalse(any(has(node, 'doomed.bin') for node in nodes))
+                self.assertTrue(all(has(node, 'kept.bin') for node in nodes))
             finally:
                 for node in nodes:
                     node.stop_event.set()
