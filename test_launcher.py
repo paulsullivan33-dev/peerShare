@@ -395,6 +395,59 @@ class ReleaseTests(unittest.TestCase):
         RuntimeControl(node, runtime, 1, 'test-token').poll()
         self.assertTrue(node.stop_event.is_set())
 
+    def test_application_log_rotates_while_the_writer_keeps_appending(self):
+        path = self.directory / 'application.log'
+        writer = path.open('ab', buffering=0)  # like the child's inherited stdout
+        try:
+            for generation in range(7):
+                writer.write(f'generation {generation}\n'.encode() * 10)
+                self.assertTrue(launch.rotate_log(path, max_bytes=50, keep=3))
+            writer.write(b'still writing\n')
+        finally:
+            writer.close()
+        self.assertEqual(path.read_bytes(), b'still writing\n')  # continues at the start, no gap
+        rotated = sorted(p.name for p in self.directory.glob('application.log.*'))
+        self.assertEqual(rotated, ['application.log.1', 'application.log.2', 'application.log.3'])
+        self.assertIn(b'generation 6', (self.directory / 'application.log.1').read_bytes())
+        self.assertIn(b'generation 4', (self.directory / 'application.log.3').read_bytes())
+        self.assertFalse(launch.rotate_log(path, max_bytes=50, keep=3))  # small: left alone
+        self.assertFalse(launch.rotate_log(self.directory / 'missing.log'))
+
+    def test_old_runtime_folders_are_pruned(self):
+        supervisor = launch.Launcher(self.installation())
+        root = supervisor.state_dir / 'runtime'
+        folders = []
+        for age in range(10):
+            folder = root / uuid.uuid4().hex
+            folder.mkdir()
+            (folder / 'health.json').write_text('{}')
+            os.utime(folder, (time.time() - 1000 * (age + 1),) * 2)
+            folders.append(folder)
+        unrelated = root / 'keep-me'
+        unrelated.mkdir()
+        orphan = folders[-1]  # oldest, but named in child.json: a child that may still run
+        release.atomic_json(supervisor.state_dir / 'child.json', {'runtime': orphan.name})
+        supervisor.runtime = root / uuid.uuid4().hex
+        supervisor.runtime.mkdir()
+        supervisor.prune_runtime()
+        remaining = {path.name for path in root.iterdir()}
+        expected = {supervisor.runtime.name, 'keep-me', orphan.name,
+                    *(folder.name for folder in folders[:launch.KEEP_RUNTIME_DIRS - 1])}
+        self.assertEqual(remaining, expected)
+
+    def test_processed_and_stale_inbox_packages_are_removed(self):
+        root = self.installation()
+        inbox = root / 'state/inbox'
+        stale, recent, queued = ('a' * 64 + '.phupdate', 'b' * 64 + '.phupdate', 'c' * 64 + '.phupdate')
+        for name in (stale, recent, queued, 'd' * 32 + '.tmp', 'notes.txt'):
+            (inbox / name).write_bytes(b'x')
+        old = time.time() - 2 * launch.INBOX_GRACE_SECONDS
+        for name in (stale, queued, 'd' * 32 + '.tmp', 'notes.txt'):
+            os.utime(inbox / name, (old, old))
+        release.atomic_json(root / 'state/update-request.json', {'package': queued})
+        launch.Launcher(root).prune_inbox()
+        self.assertEqual(sorted(path.name for path in inbox.iterdir()), sorted([recent, queued, 'notes.txt']))
+
     def test_atomic_json_retries_a_briefly_denied_replace(self):
         target = self.directory / 'state.json'
         real_replace = os.replace
@@ -488,6 +541,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((root / 'state/node.id').read_text(), identity)
             self.assertEqual((root / 'shared/keep.txt').read_text(), 'preserved across releases')
             self.assertEqual(supervisor.state['previous'], 1)
+            wait_for(lambda: not list((root / 'state/inbox').iterdir()))  # processed: removed
             launch.queue_update(root, broken)
             wait_for(lambda: '3' in supervisor.state['failed'] and supervisor.state['active'] == 2
                      and supervisor.health(2), timeout=16)
@@ -496,6 +550,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((root / 'shared/keep.txt').read_text(), 'preserved across releases')
             self.assertTrue((root / 'releases/1').is_dir())
             self.assertTrue((root / 'releases/2').is_dir())
+            wait_for(lambda: not list((root / 'state/inbox').iterdir()))  # rejected: removed too
             self.assertTrue(launch.running(root))
             launch.request_stop(root)
             thread.join(12)

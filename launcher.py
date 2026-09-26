@@ -16,7 +16,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from release_tools import (InstanceLock, atomic_json, public_key, regular,
+from release_tools import (InstanceLock, atomic_json, public_key, regular, replace_file,
                            safe_directory, stage_package, verify_directory, verify_package)
 
 # How stale health.json/lease.json can get before being considered failed. Generous enough to
@@ -29,6 +29,12 @@ DEFAULT_HEARTBEAT_TIMEOUT = 30
 # been stable for stabilize_seconds; the deadline only delays rolling back a broken release.
 DEFAULT_HEALTH_TIMEOUT = 120 if os.name == "nt" else 30
 MAX_CRASH_BACKOFF_SECONDS = 60
+# Keep the installation's own files bounded on long-running nodes.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_KEEP = 5                # application.log plus application.log.1 ... .5
+LOG_CHECK_SECONDS = 60
+KEEP_RUNTIME_DIRS = 5       # the current launch's runtime folder plus the most recent others
+INBOX_GRACE_SECONDS = 600   # never prune a queued package younger than this
 
 
 def log(message: str) -> None:
@@ -41,6 +47,25 @@ def read_json(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"invalid {path.name}")
     return value
+
+
+def rotate_log(path: Path, max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> bool:
+    """Copy-and-truncate rotation: PATH -> PATH.1 -> ... -> PATH.KEEP, dropping the oldest. The
+    child writes through an append-mode handle, so truncating the file in place is safe while it
+    runs (at worst a line written during the copy is lost)."""
+    try:
+        if path.stat().st_size < max_bytes:
+            return False
+    except FileNotFoundError:
+        return False
+    for number in range(keep - 1, 0, -1):
+        older = path.with_name(f"{path.name}.{number}")
+        if older.exists():
+            replace_file(older, path.with_name(f"{path.name}.{number + 1}"))
+    shutil.copyfile(path, path.with_name(path.name + ".1"))
+    with path.open("r+b") as handle:
+        handle.truncate(0)
+    return True
 
 
 def contains(container: Path, other: Path) -> bool:
@@ -237,6 +262,37 @@ class Launcher:
                 # (0.2s later) renews it, so one failed renewal must not stop the launcher.
                 log(f"could not renew lease: {error}")
 
+    def prune_runtime(self) -> None:
+        """Keep the current launch's runtime folder and the few most recent others."""
+        protected = {self.runtime}
+        try:
+            record = read_json(self.state_dir / "child.json")
+            protected.add(self.state_dir / "runtime" / str(record.get("runtime")))
+        except (OSError, ValueError):
+            pass
+        root = self.state_dir / "runtime"
+        folders = [path for path in root.iterdir() if re.fullmatch("[0-9a-f]{32}", path.name)
+                   and path.is_dir() and not path.is_symlink() and path not in protected]
+        folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in folders[KEEP_RUNTIME_DIRS - 1:]:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def prune_inbox(self) -> None:
+        """Remove queued packages that were already processed (their request is gone), keeping
+        the one still queued and anything young enough to be part of a queue in progress."""
+        queued = None
+        request = self.state_dir / "update-request.json"
+        if request.exists():
+            try:
+                queued = read_json(request).get("package")
+            except (OSError, ValueError):
+                return
+        cutoff = time.time() - INBOX_GRACE_SECONDS
+        for path in (self.state_dir / "inbox").iterdir():
+            if (re.fullmatch("[0-9a-f]{64}\\.phupdate|[0-9a-f]{32}\\.tmp", path.name) and
+                    path.name != queued and path.stat().st_mtime < cutoff):
+                path.unlink(missing_ok=True)
+
     def start_child(self, release: int) -> None:
         directory = self.releases / str(release)
         key = (public_key(self.state_dir / 'bootstrap-key.pem')
@@ -249,6 +305,11 @@ class Launcher:
         self.token = uuid.uuid4().hex
         self.last_health = None
         self.lease()
+        try:
+            self.prune_runtime()
+            rotate_log(safe_directory(self.state_dir / "logs") / "application.log")
+        except OSError as error:
+            log(f"could not tidy runtime folders or logs: {error}")
         # Handed to the child via a file rather than a CLI flag, since a rollback can start an
         # older release whose peer_handshake.py predates any given flag and would reject it. The
         # child gives up on an unresponsive launcher only well after the launcher would itself
@@ -433,7 +494,11 @@ class Launcher:
             atomic_json(self.state_dir / "launcher-session.json", {"session": self.session})
             self.recover_orphan()
             self.recover_transaction()
-            last_update_check = 0
+            try:
+                self.prune_inbox()
+            except OSError as error:
+                log(f"could not tidy the update inbox: {error}")
+            last_update_check = last_log_check = 0
             crash_backoff = 1
             try:
                 while not self.stop_event.is_set():
@@ -471,12 +536,23 @@ class Launcher:
                             crash_backoff = min(crash_backoff * 2, MAX_CRASH_BACKOFF_SECONDS)
                     if time.monotonic() - last_update_check >= 2:
                         last_update_check = time.monotonic()
+                        update = None
                         try:
                             update = self.next_update()
                             if update is not None:
                                 self.apply_update(update)
                         except (OSError, ValueError, zipfile.BadZipFile) as error:
                             log(f"update rejected: {error}")
+                        finally:
+                            # A queued package has served its purpose once processed.
+                            if update is not None and update.parent == self.state_dir / "inbox":
+                                update.unlink(missing_ok=True)
+                    if time.monotonic() - last_log_check >= LOG_CHECK_SECONDS:
+                        last_log_check = time.monotonic()
+                        try:
+                            rotate_log(self.state_dir / "logs" / "application.log")
+                        except OSError as error:
+                            log(f"could not rotate application.log: {error}")
                     self.stop_event.wait(.2)
             finally:
                 self.stop_child()
