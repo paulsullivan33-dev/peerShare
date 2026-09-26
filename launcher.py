@@ -23,6 +23,11 @@ from release_tools import (InstanceLock, atomic_json, public_key, regular,
 # tolerate a busy host stalling the process for a while (e.g. swap thrashing) without a false
 # failure, while still catching a genuinely hung or dead process in reasonable time.
 DEFAULT_HEARTBEAT_TIMEOUT = 30
+# How long a newly started release may take to report healthy before it counts as failed.
+# Windows gets longer: first starts from freshly written release files can be slowed well past
+# 30s (e.g. by on-access antivirus scanning). A healthy start still passes as soon as it has
+# been stable for stabilize_seconds; the deadline only delays rolling back a broken release.
+DEFAULT_HEALTH_TIMEOUT = 120 if os.name == "nt" else 30
 MAX_CRASH_BACKOFF_SECONDS = 60
 
 
@@ -55,7 +60,7 @@ def check_shared_dir(root: Path, shared_dir: Path) -> None:
 
 
 def initialize(root: Path, package: Path, trusted_key: Path, port: int, app_args: list[str],
-               auto_update: bool = False, health_timeout: float = 30,
+               auto_update: bool = False, health_timeout: float = DEFAULT_HEALTH_TIMEOUT,
                stabilize_seconds: float = 3, stop_timeout: float = 20,
                shared_dir: Path | None = None, heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT) -> None:
     if not 1 <= port <= 65535:
@@ -559,7 +564,7 @@ def main() -> None:
     initialize_parser.add_argument("--port", type=int, required=True)
     initialize_parser.add_argument("--shared-dir", type=Path)
     initialize_parser.add_argument("--auto-update", action="store_true")
-    initialize_parser.add_argument("--health-timeout", type=float, default=30)
+    initialize_parser.add_argument("--health-timeout", type=float, default=DEFAULT_HEALTH_TIMEOUT)
     initialize_parser.add_argument("--stabilize-seconds", type=float, default=3)
     initialize_parser.add_argument("--stop-timeout", type=float, default=20)
     initialize_parser.add_argument("--heartbeat-timeout", type=float, default=DEFAULT_HEARTBEAT_TIMEOUT)

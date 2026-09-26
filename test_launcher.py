@@ -166,6 +166,17 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             launch.queue_update(root, self.make_package(2))
 
+    def test_default_startup_health_deadline_is_longer_on_windows(self):
+        self.assertEqual(launch.DEFAULT_HEALTH_TIMEOUT, 120 if os.name == 'nt' else 30)
+        packaged = self.directory / 'packaged'
+        launch.initialize(packaged, self.package, self.public, free_port(), [])
+        source = self.directory / 'source'
+        launch.initialize_source(source, Path(__file__).parent, None, free_port(), [])
+        for root in (packaged, source):
+            with self.subTest(root=root.name):
+                self.assertEqual(launch.read_json(root / 'state/config.json')['health_timeout'],
+                                 launch.DEFAULT_HEALTH_TIMEOUT)
+
     def test_heartbeat_timeout_is_configurable_and_flows_to_the_launcher(self):
         root = self.installation()
         self.assertEqual(launch.Launcher(root).heartbeat_timeout, launch.DEFAULT_HEARTBEAT_TIMEOUT)
