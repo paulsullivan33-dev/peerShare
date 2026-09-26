@@ -34,7 +34,7 @@ RESERVED = {".peer-sync", "replica-conflicts"}
 # stamp so all nodes agree; then each node removes it and remembers it as retired. A node offline
 # for longer than that can reintroduce the deleted files.
 DELETE_SUFFIX = ".delete"
-MARKER_TTL_SECONDS = 30 * 86400
+MARKER_TTL_SECONDS = 86400
 MAX_MARKER_BYTES = 512
 MAX_RETIRED_MARKERS = 10000
 MARKER_FIELDS = {"peerhandshake-delete", "created", "id"}
