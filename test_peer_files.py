@@ -235,6 +235,39 @@ class FileReplicationTests(unittest.TestCase):
         self.assertTrue(lock_free and all(lock_free))
         self.assertEqual([item['path'] for item in store.manifest()['files']], ['keep.bin'])
 
+    def test_download_is_private_until_verified_then_world_writable(self):
+        content = b'p' * (f.CHUNK_BYTES + 5)
+        (self.right.file_store.root / 'shared.bin').write_bytes(content)
+        self.right.file_store.scan()
+        item = self.right.file_store.manifest()['files'][0]
+        target = self.left.file_store.root / 'shared.bin'
+        opened, chmods, partial_modes = [], [], []
+        real_open, real_chmod = os.open, Path.chmod
+
+        def recording_open(path, flags, mode=0o777, *args, **kwargs):
+            if str(path).endswith('.part'):
+                opened.append(mode)
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        def recording_chmod(path, mode, *args, **kwargs):
+            chmods.append((Path(path).name, mode, Path(path).read_bytes() == content))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        def serve(peer, request):
+            partial_modes.extend(part.stat().st_mode & 0o777 for part in self.left.file_store.temp.iterdir())
+            return self.serve_right(peer, request)
+
+        with patch.object(f.os, 'open', side_effect=recording_open), \
+             patch.object(Path, 'chmod', autospec=True, side_effect=recording_chmod), \
+             patch.object(self.left, 'exchange', side_effect=serve):
+            self.left.file_replicator.download(self.right.identity, item)
+        self.assertEqual(opened, [0o600])
+        # Only the verified, installed file is opened up; never the in-progress download.
+        self.assertEqual(chmods, [('shared.bin', 0o666, True)])
+        if os.name == 'posix':
+            self.assertTrue(partial_modes and all(mode & 0o077 == 0 for mode in partial_modes))
+            self.assertEqual(target.stat().st_mode & 0o777, 0o666)
+
     def test_unexpected_error_does_not_stop_replication_thread(self):
         replicator = self.left.file_replicator
         calls = []

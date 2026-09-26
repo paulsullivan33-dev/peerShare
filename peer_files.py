@@ -410,6 +410,12 @@ class FileStore:
                     self.records[key(item)] = old
                 raise
             self.intact.add(key(item))
+            # Other local processes need read/write access to replicas. Grant it only now, after
+            # the bytes were verified and installed, so nobody can alter them before the check.
+            try:
+                destination.chmod(0o666)
+            except OSError as error:
+                raise OSError(f"installed, but could not make it world-writable: {error}") from error
             return destination
 
 
@@ -466,8 +472,9 @@ class FileReplicator:
         deadline = time.monotonic() + FILE_DEADLINE_SECONDS
         sha = hashlib.sha256()
         try:
-            with temporary.open("xb") as output:
-                temporary.chmod(0o666)
+            # Owner-only until install() has verified and moved it into place.
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(descriptor, "wb") as output:
                 offset = 0
                 while offset < item["size"]:
                     if self.node.stop_event.is_set() or time.monotonic() >= deadline:
