@@ -1,0 +1,4 @@
+#!/bin/sh
+# Usage: sh start LOCAL_LAN_IP [SHARED_DIRECTORY]
+: "${1:?Usage: sh start LOCAL_LAN_IP [SHARED_DIRECTORY]}"
+python3 peer_handshake.py --host 0.0.0.0 --advertise-host "$1" --port 9101 --connect 192.168.1.118:9101 --shared-dir "${2:-./share}"

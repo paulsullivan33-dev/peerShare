@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# Per-node runtime state created by running the app locally
+.peer-node-*.id
+shared-*/
+share/
+
+# Signing keys and built release packages must never be committed
+*.pem
+*.phupdate
+
+# Personal Claude Code permissions
+.claude/settings.local.json

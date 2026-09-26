@@ -1,0 +1,3 @@
+#!/bin/sh
+# Usage: sh local2 [SHARED_DIRECTORY]
+python3 peer_handshake.py --port 9101 --connect 127.0.0.1:9102 --shared-dir "${1:-./share}"

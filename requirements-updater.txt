@@ -1,0 +1,3 @@
+# Application/file replication remain standard-library only.
+# The publisher and stable launcher use the maintained Ed25519 implementation.
+cryptography>=42,<51

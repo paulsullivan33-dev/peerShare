@@ -1,0 +1,5 @@
+# Shell scripts run on Linux and must keep LF line endings.
+*.sh text eol=lf
+start text eol=lf
+local1 text eol=lf
+local2 text eol=lf
