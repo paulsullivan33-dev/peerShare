@@ -349,6 +349,7 @@ class FileStore:
                     continue
                 imports.append(({"path": relative, "sha256": sha, "size": size}, before))
                 tracked.add(relative.casefold())
+        imports = self.convert_renames(imports, records)
         with self.lock:
             # Records installed while hashing keep the status install() gave them.
             self.intact = intact | {identifier for identifier in self.intact if identifier not in records}
@@ -367,16 +368,84 @@ class FileStore:
                 self.save()
         self.apply_markers()
 
-    def stamp_marker(self, path: Path) -> None:
-        """Give a newly created, empty PATH.delete its creation time and a unique ID, so all
-        nodes expire it at the same moment and each new marker is a distinct version."""
+    def convert_renames(self, imports: list, records: dict) -> list:
+        """Treat a new X.delete that is a renamed (or copied) X as a request to delete X: a file
+        whose bytes match a tracked version of X, or a folder whose every file matches the
+        tracked file at the same place under X. Those imports become stamped markers instead of
+        new shared content; anything that does not match exactly stays an ordinary import."""
+        versions = {(r["file"]["path"], r["file"]["sha256"], r["file"]["size"]) for r in records.values()}
+        result, folders = [], {}
+        for item, before in imports:
+            parts = item["path"].split("/")
+            inside = next((i for i in range(len(parts) - 1)
+                           if marker_target("/".join(parts[:i + 1])) is not None), None)
+            if inside is not None:  # A file under a folder named *.delete.
+                folders.setdefault("/".join(parts[:inside + 1]), []).append(
+                    (item, before, "/".join(parts[inside + 1:])))
+                continue
+            target = marker_target(item["path"])
+            if (target is not None and item["size"] > 0 and
+                    (target, item["sha256"], item["size"]) in versions):
+                try:
+                    path = self.safe_path(item["path"])
+                    self.stamp_marker(path, lambda: self.signature(path) == before)
+                    before = self.signature(path)
+                    sha, size = fingerprint(path, self.max_file_bytes)
+                except (OSError, ValueError):
+                    continue  # Changed meanwhile: look again on the next scan.
+                self.log(f"{item['path']} is a renamed copy of {target}: converted to a delete marker")
+                item = {"path": item["path"], "sha256": sha, "size": size}
+            result.append((item, before))
+        for prefix, members in folders.items():
+            result.extend(self.convert_folder(prefix, members, versions))
+        return result
+
+    def convert_folder(self, prefix: str, members: list, versions: set) -> list:
+        """Imports to use for folder PREFIX (a *.delete folder): the members unchanged when it is
+        not an exact renamed copy of its target, otherwise a single stamped marker at PREFIX."""
+        target = marker_target(prefix)
+        if (not any(path.startswith(target + "/") for path, _, _ in versions) or
+                any((target + "/" + rel, item["sha256"], item["size"]) not in versions
+                    for item, _, rel in members)):
+            return [(item, before) for item, before, _ in members]
+        try:
+            folder = self.safe_path(prefix)
+            # Nothing else may be inside: no extra, skipped or linked entries.
+            on_disk = set()
+            for parent, directories, files in os.walk(folder, followlinks=False):
+                if any(is_link((Path(parent) / name).lstat()) for name in directories):
+                    raise ValueError("folder contains a link")
+                on_disk.update((Path(parent) / name).relative_to(folder).as_posix() for name in files)
+            if on_disk != {rel for _, _, rel in members}:
+                raise ValueError("folder has entries that are not copies of the target")
+            for item, before, _ in members:
+                if self.signature(self.safe_path(item["path"])) != before:
+                    raise ValueError("folder changed while scanning")
+        except (OSError, ValueError):
+            return [(item, before) for item, before, _ in members]
+        try:
+            # Its files are exact copies of what the marker deletes everywhere anyway.
+            shutil.rmtree(folder)
+            self.stamp_marker(folder, lambda: not os.path.lexists(folder))
+            before = self.signature(folder)
+            sha, size = fingerprint(folder, self.max_file_bytes)
+        except (OSError, ValueError) as error:
+            self.log(f"could not convert {prefix}/ to a delete marker: {error}")
+            return []  # Its copies are (partly) gone; the next scan sees what remains.
+        self.log(f"{prefix}/ is a renamed copy of {target}/: converted to a delete marker")
+        return [({"path": prefix, "sha256": sha, "size": size}, before)]
+
+    def stamp_marker(self, path: Path, unchanged=None) -> None:
+        """Write a marker (creation time and unique ID) at PATH.delete, so all nodes expire it at
+        the same moment and each new marker is a distinct version. By default PATH.delete must be
+        a newly created empty file; `unchanged` replaces that check for converted renames."""
         temporary = self.safe_path(".peer-sync/tmp/" + uuid.uuid4().hex + ".part", internal=True)
         try:
             with temporary.open("xb") as output:
                 output.write(marker_bytes(int(time.time())))
                 output.flush()
                 os.fsync(output.fileno())
-            if path.lstat().st_size != 0:
+            if not (unchanged() if unchanged else path.lstat().st_size == 0):
                 raise ValueError("marker was written to while stamping")
             os.replace(temporary, path)
         finally:

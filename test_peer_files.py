@@ -433,6 +433,70 @@ class FileReplicationTests(unittest.TestCase):
         self.assertEqual((root / 'sub/.delete').read_bytes(), b'')
         self.assertEqual(self.manifest_paths(self.right), ['notes', 'notes.delete', 'sub/.delete'])
 
+    def test_renaming_a_file_to_delete_removes_it_everywhere(self):
+        root = self.left.file_store.root
+        (root / 'report.txt').write_bytes(b'quarterly numbers')
+        (root / 'keep.txt').write_bytes(b'keep')
+        self.left.file_store.scan()
+        self.right.handle_message(self.left.message())
+        self.sync(self.right, self.left)
+        (root / 'report.txt').rename(root / 'report.txt.delete')
+        self.left.file_store.scan()
+        self.assertIsNotNone(f.marker_created((root / 'report.txt.delete').read_bytes()))
+        self.sync(self.right, self.left)
+        self.sync(self.left, self.right)
+        for node in (self.left, self.right):
+            with self.subTest(node=node.identity.port):
+                self.assertFalse((node.file_store.root / 'report.txt').exists())
+                self.assertEqual(self.manifest_paths(node), ['keep.txt', 'report.txt.delete'])
+                # The renamed contents were never shared: every copy is the marker.
+                self.assertNotIn(b'quarterly', (node.file_store.root / 'report.txt.delete').read_bytes())
+
+    def test_renaming_a_folder_to_delete_removes_it_everywhere(self):
+        root = self.left.file_store.root
+        (root / 'photos/sub').mkdir(parents=True)
+        (root / 'photos/x.jpg').write_bytes(b'x')
+        (root / 'photos/sub/y.jpg').write_bytes(b'y')
+        (root / 'other.txt').write_bytes(b'other')
+        self.left.file_store.scan()
+        self.right.handle_message(self.left.message())
+        self.sync(self.right, self.left)
+        self.assertTrue((self.right.file_store.root / 'photos/sub/y.jpg').exists())
+        (root / 'photos').rename(root / 'photos.delete')
+        self.left.file_store.scan()
+        self.assertTrue((root / 'photos.delete').is_file())
+        self.assertIsNotNone(f.marker_created((root / 'photos.delete').read_bytes()))
+        self.sync(self.right, self.left)
+        self.sync(self.left, self.right)
+        for node in (self.left, self.right):
+            with self.subTest(node=node.identity.port):
+                self.assertFalse((node.file_store.root / 'photos').exists())
+                self.assertEqual(self.manifest_paths(node), ['other.txt', 'photos.delete'])
+
+    def test_delete_named_files_and_folders_that_are_not_exact_copies_stay_ordinary(self):
+        root = self.left.file_store.root
+        (root / 'report.txt').write_bytes(b'original')
+        (root / 'photos').mkdir()
+        (root / 'photos/x.jpg').write_bytes(b'x')
+        self.left.file_store.scan()
+        (root / 'report.txt.delete').write_bytes(b'different contents')
+        (root / 'photos.delete').mkdir()
+        (root / 'photos.delete/x.jpg').write_bytes(b'x')
+        (root / 'photos.delete/extra.txt').write_bytes(b'not in photos/')
+        (root / 'edited.delete').mkdir()
+        (root / 'edited').mkdir()
+        (root / 'edited/a.txt').write_bytes(b'a')
+        self.left.file_store.scan()
+        (root / 'edited.delete/a.txt').write_bytes(b'changed')
+        (root / 'never-shared.delete').mkdir()
+        (root / 'never-shared.delete/b.txt').write_bytes(b'b')
+        self.left.file_store.scan()
+        self.assertEqual(self.manifest_paths(self.left),
+                         ['edited.delete/a.txt', 'edited/a.txt', 'never-shared.delete/b.txt',
+                          'photos.delete/extra.txt', 'photos.delete/x.jpg', 'photos/x.jpg',
+                          'report.txt', 'report.txt.delete'])
+        self.assertEqual((root / 'report.txt.delete').read_bytes(), b'different contents')
+
     def test_index_without_retired_markers_still_loads_and_bad_ones_are_rejected(self):
         for retired, valid in (((), True), ([], True), (['a.txt\0' + 'b' * 64], True),
                                ('nope', False), ([5], False), (['../x\0' + 'b' * 64], False),
@@ -565,6 +629,16 @@ class LiveDeleteMarkerTests(unittest.TestCase):
                                      for node in nodes))
                 time.sleep(.5)  # Several more sync passes: nothing may bring it back.
                 self.assertFalse(any(has(node, 'doomed.bin') for node in nodes))
+                self.assertTrue(all(has(node, 'kept.bin') for node in nodes))
+                # Renaming a shared folder to *.delete removes it from every node too.
+                (nodes[0].file_store.root / 'album').mkdir()
+                (nodes[0].file_store.root / 'album/a.bin').write_bytes(b'a' * 3000)
+                wait_for(lambda: all(has(node, 'album/a.bin') for node in nodes))
+                (nodes[1].file_store.root / 'album').rename(nodes[1].file_store.root / 'album.delete')
+                wait_for(lambda: all(not has(node, 'album') and (node.file_store.root / 'album.delete').is_file()
+                                     for node in nodes))
+                time.sleep(.5)
+                self.assertFalse(any(has(node, 'album') for node in nodes))
                 self.assertTrue(all(has(node, 'kept.bin') for node in nodes))
             finally:
                 for node in nodes:
