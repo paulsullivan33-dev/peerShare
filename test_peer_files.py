@@ -514,6 +514,107 @@ class FileReplicationTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'index|path|digest'):
                         f.FileStore(directory).close()
 
+    def test_downloads_are_paced_to_the_rate_limit(self):
+        content = os.urandom(4 * f.CHUNK_BYTES)
+        (self.right.file_store.root / 'big.bin').write_bytes(content)
+        self.right.file_store.scan()
+        item = self.right.file_store.manifest()['files'][0]
+        replicator = self.left.file_replicator
+        replicator.download_rate = f.CHUNK_BYTES  # one chunk per second
+        clock = [1000.0]
+        waits = []
+
+        def wait(seconds):  # a simulated clock: waiting advances it
+            waits.append(seconds)
+            clock[0] += seconds
+            return False
+
+        with patch.object(f.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(self.left.stop_event, 'wait', side_effect=wait), \
+             patch.object(self.left, 'exchange', side_effect=self.serve_right):
+            replicator.download(self.right.identity, item)
+        self.assertEqual((self.left.file_store.root / 'big.bin').read_bytes(), content)
+        self.assertEqual(waits, [1.0, 1.0, 1.0, 1.0])  # 4 chunks at 1 chunk/s
+        # Idle time does not bank up a burst: after a long pause, pacing resumes at the rate.
+        clock[0] += 3600
+        waits.clear()
+        with patch.object(f.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(self.left.stop_event, 'wait', side_effect=wait):
+            replicator.pace(f.CHUNK_BYTES)
+            replicator.pace(f.CHUNK_BYTES)
+        self.assertEqual(waits, [1.0, 1.0])
+
+    def test_unlimited_rate_never_waits_and_shutdown_interrupts_pacing(self):
+        replicator = self.left.file_replicator
+        replicator.download_rate = 0
+        with patch.object(self.left.stop_event, 'wait', side_effect=AssertionError('waited')):
+            replicator.pace(10 * f.CHUNK_BYTES)
+        replicator.download_rate = f.CHUNK_BYTES
+        with patch.object(self.left.stop_event, 'wait', return_value=True), \
+             self.assertRaises(InterruptedError):
+            replicator.pace(f.CHUNK_BYTES)
+
+    def test_download_deadline_stretches_with_the_rate_limit(self):
+        replicator = self.left.file_replicator
+        replicator.download_rate = 2 * 1024 * 1024
+        self.assertEqual(replicator.deadline_for(1024), f.FILE_DEADLINE_SECONDS)
+        self.assertEqual(replicator.deadline_for(1024 ** 3), 3 * 512)  # 1 GiB at 2 MiB/s = 512s
+        replicator.download_rate = 0
+        self.assertEqual(replicator.deadline_for(1024 ** 3), f.FILE_DEADLINE_SECONDS)
+
+    def test_rate_limit_comes_from_limits_file_or_defaults(self):
+        store, replicator = self.left.file_store, self.left.file_replicator
+        limits = store.root / '.peer-sync/limits.json'
+        messages = []
+        replicator.log = messages.append
+        self.assertEqual(store.download_rate(), (f.DEFAULT_MAX_DOWNLOAD_RATE, 'default'))
+        replicator.refresh_rate()
+        replicator.refresh_rate()
+        self.assertEqual(messages, ['download rate limit: 2.00 MiB/s (default)'])  # logged once
+        limits.write_text(json.dumps({'max_download_bytes_per_second': 5 * 1024 * 1024}))
+        replicator.refresh_rate()
+        self.assertEqual(replicator.download_rate, 5 * 1024 * 1024)
+        self.assertIn('5.00 MiB/s', messages[-1])
+        limits.write_text(json.dumps({'max_download_bytes_per_second': 0}))
+        replicator.refresh_rate()
+        self.assertEqual(replicator.download_rate, 0)
+        self.assertIn('unlimited', messages[-1])
+        for bad in ('{not json', '[]', '{"max_download_bytes_per_second": 100}',
+                    '{"max_download_bytes_per_second": "fast"}', '{"other": 1}'):
+            with self.subTest(bad=bad):
+                limits.write_text(bad)
+                rate, source = store.download_rate()
+                self.assertEqual(rate, f.DEFAULT_MAX_DOWNLOAD_RATE)
+                self.assertIn('default;', source)
+
+    def test_briefly_denied_file_operations_are_retried(self):
+        outcomes = [PermissionError(5, 'Access is denied'), PermissionError(5, 'Access is denied'), 'done']
+
+        def action():
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(f.time, 'sleep') as sleep:
+            self.assertEqual(f.retry_denied(action), 'done')
+            self.assertEqual(sleep.call_count, 2)
+            with self.assertRaises(PermissionError):
+                f.retry_denied(lambda: (_ for _ in ()).throw(PermissionError(5, 'denied')))
+        # A saved index survives a briefly locked index.json.
+        real_replace = os.replace
+        denied = [PermissionError(5, 'Access is denied')]
+
+        def locked_once(source, destination):
+            if denied:
+                raise denied.pop()
+            real_replace(source, destination)
+
+        with patch.object(f.os, 'replace', side_effect=locked_once), patch.object(f.time, 'sleep'):
+            (self.left.file_store.root / 'a.txt').write_bytes(b'a')
+            self.left.file_store.scan()
+        self.assertIn('a.txt', (self.left.file_store.root / '.peer-sync/index.json').read_text())
+
     def test_unexpected_error_does_not_stop_replication_thread(self):
         replicator = self.left.file_replicator
         calls = []

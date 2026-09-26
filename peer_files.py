@@ -25,6 +25,13 @@ SYNC_INTERVAL_SECONDS = 15
 FULL_VERIFY_SECONDS = 3600
 FILE_DEADLINE_SECONDS = 300
 MAX_DOWNLOADS_PER_PASS = 32
+# Each node paces its own downloads to at most this many bytes per second, so replication traffic
+# across the whole network stays below (number of nodes) x this. A node can override it, without a
+# restart, in SHARED/.peer-sync/limits.json: {"max_download_bytes_per_second": N} (0 = unlimited).
+# A file rather than a command-line flag, so rolling back to an older release still starts.
+DEFAULT_MAX_DOWNLOAD_RATE = 2 * 1024 * 1024
+MIN_DOWNLOAD_RATE = 64 * 1024
+LIMITS_FILE = ".peer-sync/limits.json"
 REQUEST_TYPES = ("file-manifest", "file-chunk")
 RESPONSE_TYPES = ("file-manifest-result", "file-chunk-result", "file-error")
 RESERVED = {".peer-sync", "replica-conflicts"}
@@ -105,6 +112,18 @@ def marker_created(data: bytes) -> int | None:
     except ValueError:
         return None
     return value["created"]
+
+
+def retry_denied(action, attempts: int = 20):
+    """Run ACTION, retrying briefly when Windows denies access because another process (such as
+    antivirus scanning a newly written file) has it open; that clears within milliseconds."""
+    for attempt in range(attempts):
+        try:
+            return action()
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(.025)
 
 
 def is_link(info: os.stat_result) -> bool:
@@ -278,7 +297,7 @@ class FileStore:
                            "retired_markers": list(self.retired_markers)}, output)
                 output.flush()
                 os.fsync(output.fileno())
-            os.replace(temporary, self.index_path)
+            retry_denied(lambda: os.replace(temporary, self.index_path))
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -425,7 +444,7 @@ class FileStore:
             return [(item, before) for item, before, _ in members]
         try:
             # Its files are exact copies of what the marker deletes everywhere anyway.
-            shutil.rmtree(folder)
+            retry_denied(lambda: shutil.rmtree(folder))
             self.stamp_marker(folder, lambda: not os.path.lexists(folder))
             before = self.signature(folder)
             sha, size = fingerprint(folder, self.max_file_bytes)
@@ -447,13 +466,27 @@ class FileStore:
                 os.fsync(output.fileno())
             if not (unchanged() if unchanged else path.lstat().st_size == 0):
                 raise ValueError("marker was written to while stamping")
-            os.replace(temporary, path)
+            retry_denied(lambda: os.replace(temporary, path))
         finally:
             temporary.unlink(missing_ok=True)
         try:
             path.chmod(0o666)  # Same access for other local processes as replicated files.
         except OSError:
             pass
+
+    def download_rate(self) -> tuple[int, str]:
+        """This node's download cap in bytes per second (0 = unlimited) and where it came from."""
+        try:
+            value = json.loads(self.safe_path(LIMITS_FILE, internal=True).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return DEFAULT_MAX_DOWNLOAD_RATE, "default"
+        except (OSError, ValueError) as error:
+            return DEFAULT_MAX_DOWNLOAD_RATE, f"default; {LIMITS_FILE} unreadable: {error}"
+        rate = value.get("max_download_bytes_per_second") if isinstance(value, dict) else None
+        if type(rate) is not int or not (rate == 0 or rate >= MIN_DOWNLOAD_RATE):
+            return DEFAULT_MAX_DOWNLOAD_RATE, (f"default; {LIMITS_FILE} needs max_download_bytes_per_second "
+                                               f"as 0 (unlimited) or an integer of at least {MIN_DOWNLOAD_RATE}")
+        return rate, LIMITS_FILE
 
     def blocked(self, item: dict) -> bool:
         """True for a version an active marker deletes, or an expired marker already removed."""
@@ -628,7 +661,7 @@ class FileStore:
             try:
                 # Persist expected bytes first, so a crash cannot import a partial copy as new content.
                 self.save()
-                os.replace(temporary, destination)
+                retry_denied(lambda: os.replace(temporary, destination))
             except Exception:
                 if old is None:
                     self.records.pop(key(item), None)
@@ -652,6 +685,32 @@ class FileReplicator:
         self.sync_lock = threading.Lock()
         # Last complete manifest fetched from each peer, keyed by peer: (generation, files).
         self.manifests: dict = {}
+        self.download_rate = DEFAULT_MAX_DOWNLOAD_RATE
+        self.rate_source = None
+        self.pace_until = 0.0
+
+    def refresh_rate(self) -> None:
+        rate, source = self.store.download_rate()
+        if (rate, source) != (self.download_rate, self.rate_source):
+            shown = "unlimited" if rate == 0 else f"{rate / 1048576:.2f} MiB/s"
+            self.log(f"download rate limit: {shown} ({source})")
+        self.download_rate, self.rate_source = rate, source
+
+    def deadline_for(self, size: int) -> float:
+        """Seconds a download may take: the usual limit, stretched to 3x what the cap allows."""
+        if self.download_rate <= 0:
+            return FILE_DEADLINE_SECONDS
+        return max(FILE_DEADLINE_SECONDS, 3 * size / self.download_rate)
+
+    def pace(self, size: int) -> None:
+        """Wait after receiving SIZE bytes so downloads average at most the rate limit. Idle time
+        does not bank up a burst; waiting stops early when the node is shutting down."""
+        if self.download_rate <= 0:
+            return
+        now = time.monotonic()
+        self.pace_until = max(self.pace_until, now) + size / self.download_rate
+        if self.pace_until > now and self.node.stop_event.wait(self.pace_until - now):
+            raise InterruptedError("file transfer interrupted")
 
     def request(self, peer, kind: str, **fields) -> dict:
         request = self.node.message(kind)
@@ -705,7 +764,7 @@ class FileReplicator:
             raise ValueError("replication storage limit exceeded")
         self.store.ensure_layout()
         temporary = self.store.safe_path(".peer-sync/tmp/" + uuid.uuid4().hex + ".part", internal=True)
-        deadline = time.monotonic() + FILE_DEADLINE_SECONDS
+        deadline = time.monotonic() + self.deadline_for(item["size"])
         sha = hashlib.sha256()
         try:
             # Owner-only until install() has verified and moved it into place.
@@ -727,6 +786,7 @@ class FileReplicator:
                     output.write(data)
                     sha.update(data)
                     offset += len(data)
+                    self.pace(len(data))
                 output.flush()
                 os.fsync(output.fileno())
             if sha.hexdigest() != item["sha256"]:
@@ -741,6 +801,7 @@ class FileReplicator:
             return
         try:
             self.store.scan()
+            self.refresh_rate()
             with self.node.peers_lock:
                 peers = [peer for peer, record in self.node.profiles.items()
                          if peer in self.node.confirmed and record["expires_at"] > time.monotonic()
