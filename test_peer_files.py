@@ -1,6 +1,7 @@
 import base64
 import copy
 import hashlib
+import json
 import os
 import shutil
 import socket
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -267,6 +269,18 @@ class FileReplicationTests(unittest.TestCase):
         if os.name == 'posix':
             self.assertTrue(partial_modes and all(mode & 0o077 == 0 for mode in partial_modes))
             self.assertEqual(target.stat().st_mode & 0o777, 0o666)
+
+    def test_malformed_index_records_fail_with_a_clean_error(self):
+        good = {'file': {'path': 'a.txt', 'sha256': 'a' * 64, 'size': 1}, 'destination': 'a.txt'}
+        for record in (1, None, [], {}, {'file': good['file']}, {'destination': 'a.txt'},
+                       dict(good, destination=5), dict(good, destination=None), dict(good, extra=1),
+                       dict(good, file='a.txt')):
+            with self.subTest(record=record):
+                directory = self.root / ('index-' + uuid.uuid4().hex)
+                (directory / '.peer-sync').mkdir(parents=True)
+                (directory / '.peer-sync/index.json').write_text(json.dumps({'version': 1, 'files': [record]}))
+                with self.assertRaisesRegex(ValueError, 'index|file entry'):
+                    f.FileStore(directory).close()
 
     def test_unexpected_error_does_not_stop_replication_thread(self):
         replicator = self.left.file_replicator

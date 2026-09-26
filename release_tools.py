@@ -9,6 +9,7 @@ import platform
 import shutil
 import stat
 import sys
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -28,6 +29,19 @@ def canonical(value: dict) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
+def replace_file(source: Path, destination: Path, attempts: int = 20) -> None:
+    """os.replace, retried briefly: Windows denies replacing a file another process has open
+    (e.g. the application reading lease.json at that moment), which clears within milliseconds."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(.025)
+
+
 def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
@@ -35,7 +49,7 @@ def atomic_json(path: Path, value: dict) -> None:
             output.write(canonical(value))
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        replace_file(temporary, path)
         if os.name != "nt":
             descriptor = os.open(path.parent, os.O_RDONLY)
             try:

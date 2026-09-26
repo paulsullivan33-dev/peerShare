@@ -25,24 +25,32 @@ class RuntimeControl:
             pass
         self.release, self.token, self.lease_timeout = release, token, lease_timeout
         self.counter = 0
+        self.last_valid_lease = time.monotonic()
 
     def poll(self) -> None:
         lease = self.directory / "lease.json"
         try:
-            valid_lease = (json.loads(lease.read_text(encoding="utf-8")).get("token") == self.token
-                           and time.time() - lease.stat().st_mtime < self.lease_timeout)
+            value = json.loads(lease.read_text(encoding="utf-8"))
+            modified = lease.stat().st_mtime
         except (OSError, ValueError):
-            valid_lease = False
-        if not valid_lease:
+            # Unreadable this time, e.g. Windows denies access while the launcher replaces the
+            # file. Unknown rather than invalid; the lease timeout below still bounds it.
+            valid_lease = None
+        else:
+            valid_lease = (isinstance(value, dict) and value.get("token") == self.token
+                           and time.time() - modified < self.lease_timeout)
+        if valid_lease:
+            self.last_valid_lease = time.monotonic()
+        elif valid_lease is False or time.monotonic() - self.last_valid_lease >= self.lease_timeout:
             self.node.stop_event.set()
         control = self.directory / "control.json"
         try:
             request = json.loads(control.read_text(encoding="utf-8"))
-            if request == {"command": "stop", "token": self.token}:
-                self.node.update_status(availability="draining")
-                self.node.stop_event.set()
-        except FileNotFoundError:
-            pass
+        except (OSError, ValueError):
+            request = None  # Missing, being replaced, or malformed: no command on this poll.
+        if request == {"command": "stop", "token": self.token}:
+            self.node.update_status(availability="draining")
+            self.node.stop_event.set()
         self.counter += 1
         data = {"pid": os.getpid(), "release": self.release, "token": self.token,
                 "counter": self.counter, "phase": "draining" if self.node.stop_event.is_set() else "ready",
@@ -51,6 +59,10 @@ class RuntimeControl:
         try:
             temporary.write_text(json.dumps(data), encoding="utf-8")
             os.replace(temporary, self.directory / "health.json")
+        except OSError:
+            # e.g. Windows refuses to replace health.json while the launcher is reading it.
+            # Skip this beat; the next poll writes a newer one well within the heartbeat timeout.
+            pass
         finally:
             temporary.unlink(missing_ok=True)
 

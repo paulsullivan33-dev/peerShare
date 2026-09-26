@@ -160,6 +160,7 @@ class Launcher:
         self.child = None
         self.runtime = None
         self.token = None
+        self.last_health = None
         self.output = None
         self.seen_packages = {}
         self.update_cursor = 0
@@ -208,13 +209,28 @@ class Launcher:
 
     def lease(self) -> None:
         control = self.state_dir / "launcher-control.json"
-        if control.exists():
+        request = None
+        try:
             request = read_json(control)
             control.unlink(missing_ok=True)
-            if request.get("session") == self.session and request.get("command") == "stop":
-                self.stop_event.set()
+        except FileNotFoundError:
+            pass
+        except ValueError:
+            try:
+                control.unlink(missing_ok=True)  # Malformed request: discard rather than crash.
+            except OSError:
+                pass
+        except OSError:
+            pass  # Being replaced right now (Windows); read it on the next tick.
+        if request is not None and request.get("session") == self.session and request.get("command") == "stop":
+            self.stop_event.set()
         if self.runtime is not None:
-            atomic_json(self.runtime / "lease.json", {"token": self.token})
+            try:
+                atomic_json(self.runtime / "lease.json", {"token": self.token})
+            except OSError as error:
+                # The child tolerates a lease up to 3x the heartbeat timeout old; the next tick
+                # (0.2s later) renews it, so one failed renewal must not stop the launcher.
+                log(f"could not renew lease: {error}")
 
     def start_child(self, release: int) -> None:
         directory = self.releases / str(release)
@@ -226,6 +242,7 @@ class Launcher:
             raise ValueError("installed release number does not match its directory")
         self.runtime = safe_directory(self.state_dir / "runtime" / uuid.uuid4().hex)
         self.token = uuid.uuid4().hex
+        self.last_health = None
         self.lease()
         # Handed to the child via a file rather than a CLI flag, since a rollback can start an
         # older release whose peer_handshake.py predates any given flag and would reject it. The
@@ -256,13 +273,20 @@ class Launcher:
             return None
         path = self.runtime / "health.json"
         try:
-            value = read_json(path)
-            if (value.get("pid") == self.child.pid and value.get("token") == self.token and
-                    value.get("release") == release and value.get("phase") == "ready" and
-                    time.time() - path.stat().st_mtime < self.heartbeat_timeout):
-                return value
+            value, modified = read_json(path), path.stat().st_mtime
+            self.last_health = (value, modified)
+        except FileNotFoundError:
+            return None
         except (OSError, ValueError):
-            pass
+            # Unreadable right now, e.g. Windows denies access while the child replaces it.
+            # Judge the last heartbeat actually read instead; it still goes stale on schedule.
+            if self.last_health is None:
+                return None
+            value, modified = self.last_health
+        if (value.get("pid") == self.child.pid and value.get("token") == self.token and
+                value.get("release") == release and value.get("phase") == "ready" and
+                time.time() - modified < self.heartbeat_timeout):
+            return value
         return None
 
     def wait_ready(self, release: int) -> bool:
@@ -290,7 +314,11 @@ class Launcher:
             return
         try:
             if self.child.poll() is None:
-                atomic_json(self.runtime / "control.json", {"command": "stop", "token": self.token})
+                try:
+                    atomic_json(self.runtime / "control.json", {"command": "stop", "token": self.token})
+                except OSError as error:
+                    # Still stop it: fall through to waiting, then terminate/kill.
+                    log(f"could not request graceful stop: {error}")
                 try:
                     self.child.wait(timeout=self.config["stop_timeout"])
                 except subprocess.TimeoutExpired:

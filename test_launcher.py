@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -321,6 +322,127 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(launch.read_json(runtime / 'health.json')['phase'], 'draining')
         control.close()
         self.assertEqual(launch.read_json(runtime / 'exit.json')['token'], 'test-token')
+
+    def test_malformed_control_file_and_failed_heartbeat_write_do_not_stop_application(self):
+        node = app.PeerNode('127.0.0.1', free_port(), None)
+        runtime = self.directory / 'runtime'
+        runtime.mkdir()
+        release.atomic_json(runtime / 'lease.json', {'token': 'test-token'})
+        control = RuntimeControl(node, runtime, 1, 'test-token')
+        for content in ('{not json', '"stop"', '[]', '\udcff'):
+            with self.subTest(content=content):
+                (runtime / 'control.json').write_text(content, encoding='utf-8', errors='surrogateescape')
+                control.poll()
+                self.assertFalse(node.stop_event.is_set())
+                self.assertEqual(launch.read_json(runtime / 'health.json')['counter'], control.counter)
+        # Windows refuses to replace health.json while the launcher has it open for reading.
+        with patch('peer_runtime.os.replace', side_effect=PermissionError(5, 'Access is denied')):
+            control.poll()
+        self.assertFalse(node.stop_event.is_set())
+        self.assertEqual([path.name for path in runtime.glob('*.tmp')], [])
+        control.poll()
+        self.assertEqual(launch.read_json(runtime / 'health.json')['counter'], control.counter)
+        release.atomic_json(runtime / 'control.json', {'command': 'stop', 'token': 'test-token'})
+        control.poll()
+        self.assertTrue(node.stop_event.is_set())
+
+    def test_briefly_unreadable_lease_does_not_stop_application(self):
+        node = app.PeerNode('127.0.0.1', free_port(), None)
+        runtime = self.directory / 'runtime'
+        runtime.mkdir()
+        release.atomic_json(runtime / 'lease.json', {'token': 'test-token'})
+        control = RuntimeControl(node, runtime, 1, 'test-token', lease_timeout=90)
+        control.poll()
+        real_read = Path.read_text
+
+        def denied(path, *args, **kwargs):
+            if path.name == 'lease.json':
+                raise PermissionError(5, 'Access is denied')  # Windows, mid-replace
+            return real_read(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', autospec=True, side_effect=denied):
+            control.poll()
+            self.assertFalse(node.stop_event.is_set())
+            # Still unreadable once the lease timeout has passed: the launcher is presumed gone.
+            with patch('peer_runtime.time.monotonic', return_value=time.monotonic() + 91):
+                control.poll()
+            self.assertTrue(node.stop_event.is_set())
+
+    def test_lease_with_wrong_token_stops_application_immediately(self):
+        node = app.PeerNode('127.0.0.1', free_port(), None)
+        runtime = self.directory / 'runtime'
+        runtime.mkdir()
+        release.atomic_json(runtime / 'lease.json', {'token': 'another-launch'})
+        RuntimeControl(node, runtime, 1, 'test-token').poll()
+        self.assertTrue(node.stop_event.is_set())
+
+    def test_atomic_json_retries_a_briefly_denied_replace(self):
+        target = self.directory / 'state.json'
+        real_replace = os.replace
+        denied = PermissionError(5, 'Access is denied')
+        outcomes = [denied, denied, None]
+
+        def flaky_replace(source, destination):
+            if outcomes.pop(0) is not None:
+                raise denied
+            real_replace(source, destination)
+
+        with patch('release_tools.os.replace', side_effect=flaky_replace) as replace, \
+             patch('release_tools.time.sleep'):
+            release.atomic_json(target, {'value': 1})
+        self.assertEqual(replace.call_count, 3)
+        self.assertEqual(launch.read_json(target), {'value': 1})
+        with patch('release_tools.os.replace', side_effect=denied), patch('release_tools.time.sleep'), \
+             self.assertRaises(PermissionError):
+            release.atomic_json(target, {'value': 2})
+        self.assertEqual(launch.read_json(target), {'value': 1})
+        self.assertEqual(list(self.directory.glob('*.tmp')), [])
+
+    def test_briefly_unreadable_health_file_does_not_count_as_unhealthy(self):
+        supervisor = launch.Launcher(self.installation())
+        try:
+            self.assertTrue(supervisor.launch_ready(1))
+            real_read = launch.read_json
+
+            def denied(path):
+                if path.name == 'health.json':
+                    raise PermissionError(5, 'Access is denied')  # child replacing it right now
+                return real_read(path)
+
+            with patch.object(launch, 'read_json', side_effect=denied):
+                self.assertIsNotNone(supervisor.health(1))
+                # The last heartbeat read still goes stale on schedule.
+                with patch('launcher.time.time', return_value=time.time() + supervisor.heartbeat_timeout + 1):
+                    self.assertIsNone(supervisor.health(1))
+        finally:
+            supervisor.stop_child()
+
+    def test_failed_lease_renewal_and_malformed_stop_request_do_not_crash_launcher(self):
+        supervisor = launch.Launcher(self.installation())
+        supervisor.runtime = release.safe_directory(supervisor.state_dir / 'runtime' / uuid.uuid4().hex)
+        supervisor.token = 'token'
+        with patch.object(launch, 'atomic_json', side_effect=PermissionError(5, 'Access is denied')), \
+             patch.object(launch, 'log') as log:
+            supervisor.lease()
+        self.assertIn('could not renew lease', log.call_args.args[0])
+        control = supervisor.state_dir / 'launcher-control.json'
+        control.write_text('{not json')
+        supervisor.lease()
+        self.assertFalse(control.exists())
+        self.assertFalse(supervisor.stop_event.is_set())
+        release.atomic_json(control, {'command': 'stop', 'session': supervisor.session})
+        supervisor.lease()
+        self.assertTrue(supervisor.stop_event.is_set())
+
+    def test_child_is_still_stopped_when_stop_request_cannot_be_written(self):
+        supervisor = launch.Launcher(self.installation())
+        self.assertTrue(supervisor.launch_ready(1))
+        child = supervisor.child
+        with patch.object(launch, 'atomic_json', side_effect=PermissionError(5, 'Access is denied')), \
+             patch.object(launch, 'log'):
+            supervisor.stop_child()
+        self.assertIsNotNone(child.poll())
+        self.assertIsNone(supervisor.child)
 
     def test_manual_upgrade_restart_and_failed_release_rollback_preserve_data(self):
         root = self.installation()

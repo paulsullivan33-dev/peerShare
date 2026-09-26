@@ -126,6 +126,9 @@ class FileStore:
                 raise ValueError("replication index exceeds max files")
             destinations = set()
             for record in raw["files"]:
+                if (not isinstance(record, dict) or set(record) != {"file", "destination"} or
+                        not isinstance(record["destination"], str)):
+                    raise ValueError("invalid replication index; refusing to replace it")
                 item = entry(record["file"], self.max_file_bytes)
                 destination = record["destination"]
                 if destination not in (item["path"], self.conflict_path(item)):
