@@ -188,6 +188,9 @@ class FileStore:
         self.retired_markers: dict[str, None] = {}
         self.deleting: tuple[str, ...] = ()
         self.marker_times: dict[str, int] = {}
+        # Stamped markers are kept out of sight in .peer-sync/markers/SHA256.json (never in the
+        # shared folder itself) but are still offered to and served to peers like any file.
+        self.markers: dict[str, dict] = {}
         self.log = lambda message: None
         if self.index_path.exists():
             raw = json.loads(self.index_path.read_text(encoding="utf-8"))
@@ -219,6 +222,17 @@ class FileStore:
                 logical_path(path)
                 digest(sha)
                 self.retired_markers[identifier] = None
+            # A separate key, so releases from before hidden markers still load this index.
+            hidden = raw.get("markers", [])
+            if not isinstance(hidden, list) or len(hidden) > self.max_files:
+                raise ValueError("invalid replication index; refusing to replace it")
+            for record in hidden:
+                if not isinstance(record, dict) or set(record) != {"file"}:
+                    raise ValueError("invalid replication index; refusing to replace it")
+                item = entry(record["file"], MAX_MARKER_BYTES)
+                if marker_target(item["path"]) is None or key(item) in self.markers:
+                    raise ValueError("invalid replication index; refusing to replace it")
+                self.markers[key(item)] = item
 
         owner_path = self.safe_path(".peer-sync/owner.lock", internal=True)
         owner = owner_path.open("a+b")
@@ -294,7 +308,8 @@ class FileStore:
         try:
             with temporary.open("x", encoding="utf-8") as output:
                 json.dump({"version": 1, "files": list(self.records.values()),
-                           "retired_markers": list(self.retired_markers)}, output)
+                           "retired_markers": list(self.retired_markers),
+                           "markers": [{"file": item} for item in self.markers.values()]}, output)
                 output.flush()
                 os.fsync(output.fileno())
             retry_denied(lambda: os.replace(temporary, self.index_path))
@@ -494,48 +509,115 @@ class FileStore:
             return (key(item) in self.retired_markers or
                     any(covers(target, item["path"]) for target in self.deleting))
 
+    def marker_file(self, item: dict) -> Path:
+        return self.safe_path(".peer-sync/markers/" + item["sha256"] + ".json", internal=True)
+
+    def hidden_marker_time(self, identifier: str, item: dict) -> int | None:
+        """Creation time of a hidden marker, or None if its stored bytes are missing or damaged."""
+        if identifier not in self.marker_times:
+            try:
+                data = self.marker_file(item).read_bytes()
+            except (OSError, ValueError):
+                return None
+            if hashlib.sha256(data).hexdigest() != item["sha256"] or len(data) != item["size"]:
+                return None
+            created = marker_created(data)
+            if not created:
+                return None
+            self.marker_times[identifier] = created
+        return self.marker_times[identifier]
+
+    def hide_markers(self) -> bool:
+        """Move stamped markers out of the shared folder into .peer-sync/markers. Covers markers
+        created or renamed here, and visible ones left by releases before hidden markers."""
+        changed = False
+        for identifier, record in list(self.records.items()):
+            if (marker_target(record["file"]["path"]) is None or identifier not in self.intact or
+                    record["file"]["size"] > MAX_MARKER_BYTES or self.marker_times.get(identifier) == 0):
+                continue
+            visible = self.safe_path(record["destination"], internal=True)
+            try:
+                created = marker_created(visible.read_bytes())
+            except (OSError, ValueError):
+                continue  # Unreadable right now; try again on the next scan.
+            if not created:
+                self.marker_times[identifier] = 0  # An ordinary file whose name ends in .delete.
+                continue
+            try:
+                if identifier in self.markers:
+                    visible.unlink(missing_ok=True)  # Already hidden: this is a duplicate copy.
+                else:
+                    hidden = self.marker_file(record["file"])
+                    hidden.parent.mkdir(exist_ok=True)
+                    retry_denied(lambda: os.replace(visible, hidden))
+            except OSError as error:
+                self.log(f"could not hide marker {record['destination']}: {error}")
+                continue
+            self.markers[identifier] = record["file"]
+            self.marker_times[identifier] = created
+            del self.records[identifier]
+            self.intact.discard(identifier)
+            self.verified.pop(identifier, None)
+            self.remove_empty_parents(visible)
+            changed = True
+        return changed
+
     def apply_markers(self) -> None:
-        """Delete everything active markers cover and remove markers that have expired."""
+        """Hide new markers, delete everything active markers cover, and drop expired markers."""
         now = time.time()
         with self.lock:
-            active, expired = [], []
-            for identifier, record in self.records.items():
-                target = marker_target(record["file"]["path"])
-                if target is None or identifier not in self.intact:
-                    continue
-                if identifier not in self.marker_times:
-                    created = None
-                    if record["file"]["size"] <= MAX_MARKER_BYTES:
-                        try:
-                            created = marker_created(
-                                self.safe_path(record["destination"], internal=True).read_bytes())
-                        except (OSError, ValueError):
-                            continue  # Unreadable right now; try again on the next scan.
-                    self.marker_times[identifier] = created or 0
-                created = self.marker_times[identifier]
-                if not created:
-                    continue  # An ordinary file whose name happens to end in .delete.
-                (expired if now >= created + MARKER_TTL_SECONDS else active).append((identifier, target))
-            self.deleting = tuple(target for _, target in active)
-            removed = []
-            for identifier, _ in expired:
+            changed = self.hide_markers()
+            active, expired, broken = [], [], []
+            for identifier, item in self.markers.items():
+                created = self.hidden_marker_time(identifier, item)
+                if created is None:
+                    broken.append(identifier)  # Forget it, so a peer can supply it again.
+                elif now >= created + MARKER_TTL_SECONDS:
+                    expired.append(identifier)
+                else:
+                    active.append((identifier, item))
+            # A marker covered by another active one (e.g. "x.delete.delete") is removed too.
+            targets = [marker_target(item["path"]) for _, item in active]
+            covered = [identifier for identifier, item in active
+                       if any(covers(target, item["path"]) for target in targets)]
+            self.deleting = tuple(marker_target(item["path"]) for identifier, item in active
+                                  if identifier not in covered)
+            dropped_markers = [(identifier, "expired marker") for identifier in expired]
+            dropped_markers += [(identifier, "deleted by marker") for identifier in covered]
+            for identifier in broken:
+                self.markers.pop(identifier, None)
+                self.marker_times.pop(identifier, None)
+                changed = True
+            for identifier, _ in dropped_markers:
                 self.retired_markers[identifier] = None
-                removed.append((identifier, self.records[identifier], "expired marker"))
             while len(self.retired_markers) > MAX_RETIRED_MARKERS:
                 del self.retired_markers[next(iter(self.retired_markers))]
-            for identifier, record in self.records.items():
-                if any(covers(target, record["file"]["path"]) for target in self.deleting):
-                    removed.append((identifier, record, "deleted by marker"))
-            if not removed:
+            removed = [(identifier, record, "deleted by marker") for identifier, record in self.records.items()
+                       if any(covers(target, record["file"]["path"]) for target in self.deleting)]
+            if not (removed or dropped_markers):
+                if changed:
+                    self.save()
                 return
             for identifier, _, _ in removed:
                 self.records.pop(identifier, None)
                 self.intact.discard(identifier)
                 self.verified.pop(identifier, None)
                 self.marker_times.pop(identifier, None)
+            hidden_files = []
+            for identifier, reason in dropped_markers:
+                item = self.markers.pop(identifier)
+                self.marker_times.pop(identifier, None)
+                hidden_files.append((item, reason))
             # Forget the versions first: a crash before unlinking leaves untracked files that
             # the next scan imports and the still-active marker deletes again.
             self.save()
+            for item, reason in hidden_files:
+                try:
+                    self.marker_file(item).unlink(missing_ok=True)
+                except (OSError, ValueError) as error:
+                    self.log(f"could not remove marker {item['path']}: {error}")
+                    continue
+                self.log(f"{reason}: removed marker {item['path']}")
             for _, record, reason in removed:
                 try:
                     path = self.safe_path(record["destination"], internal=True)
@@ -557,7 +639,8 @@ class FileStore:
 
     def manifest(self, after: str = "", generation: str | None = None) -> dict:
         with self.lock:
-            files = [self.records[identifier]["file"] for identifier in sorted(self.intact)]
+            files = sorted([self.records[identifier]["file"] for identifier in self.intact] +
+                           list(self.markers.values()), key=key)
         current = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
         if generation is not None and generation != current:
             raise ValueError("manifest changed; restart pagination")
@@ -585,10 +668,13 @@ class FileStore:
 
     def chunk(self, item: dict, offset: int) -> dict:
         with self.lock:
-            record = self.records.get(key(item))
-            if record is None or key(item) not in self.intact or record["file"] != item:
-                raise ValueError("file unavailable")
-            path = self.safe_path(record["destination"], internal=True)
+            if self.markers.get(key(item)) == item:
+                path = self.marker_file(item)
+            else:
+                record = self.records.get(key(item))
+                if record is None or key(item) not in self.intact or record["file"] != item:
+                    raise ValueError("file unavailable")
+                path = self.safe_path(record["destination"], internal=True)
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_size != item["size"]:
                 raise ValueError("file changed")
@@ -603,6 +689,8 @@ class FileStore:
     def has_copy(self, item: dict) -> bool:
         # Relies on the latest scan() or install() rather than rehashing per manifest entry.
         with self.lock:
+            if self.markers.get(key(item)) == item:
+                return True
             record = self.records.get(key(item))
             return record is not None and record["file"] == item and key(item) in self.intact
 
@@ -623,6 +711,15 @@ class FileStore:
         with self.lock:
             if self.blocked(item):
                 raise ValueError("removed by a .delete marker")
+            if (marker_target(item["path"]) is not None and item["size"] <= MAX_MARKER_BYTES and
+                    marker_created(temporary.read_bytes())):
+                # A delete marker goes straight to .peer-sync/markers, never into the shared folder.
+                hidden = self.marker_file(item)
+                hidden.parent.mkdir(exist_ok=True)
+                retry_denied(lambda: os.replace(temporary, hidden))
+                self.markers[key(item)] = item
+                self.save()
+                return hidden
             if not self.can_receive(item):
                 raise ValueError("replication storage limit exceeded")
             record = self.records.get(key(item))

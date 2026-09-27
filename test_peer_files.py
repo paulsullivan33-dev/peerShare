@@ -17,6 +17,14 @@ import peer_handshake as m
 import peer_files as f
 
 
+def hidden_marker(node, path):
+    """Bytes of NODE's hidden delete marker (in .peer-sync/markers) for PATH, or None."""
+    store = node.file_store
+    with store.lock:
+        item = next((item for item in store.markers.values() if item['path'] == path), None)
+    return None if item is None else store.marker_file(item).read_bytes()
+
+
 class FileReplicationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -346,13 +354,16 @@ class FileReplicationTests(unittest.TestCase):
         marker = self.right.file_store.root / 'a.txt.delete'
         marker.touch()
         self.right.file_store.scan()
-        self.assertIsNotNone(f.marker_created(marker.read_bytes()))  # stamped
+        self.assertFalse(marker.exists())  # moved out of the shared folder...
+        stamped = hidden_marker(self.right, 'a.txt.delete')
+        self.assertIsNotNone(f.marker_created(stamped))  # ...into .peer-sync/markers, stamped
         self.assertFalse((self.right.file_store.root / 'a.txt').exists())
         self.assertEqual(self.manifest_paths(self.right), ['a.txt.delete', 'keep.txt'])
 
         self.sync(self.left, self.right)
         self.assertFalse((self.left.file_store.root / 'a.txt').exists())
-        self.assertEqual((self.left.file_store.root / 'a.txt.delete').read_bytes(), marker.read_bytes())
+        self.assertEqual(hidden_marker(self.left, 'a.txt.delete'), stamped)
+        self.assertFalse((self.left.file_store.root / 'a.txt.delete').exists())  # never visible
         self.assertEqual(self.manifest_paths(self.left), ['a.txt.delete', 'keep.txt'])
         # A peer that has not seen the marker yet cannot bring the file back...
         self.left.handle_message(stale.message())
@@ -408,6 +419,7 @@ class FileReplicationTests(unittest.TestCase):
         with patch.object(f.time, 'time', return_value=later):
             store.scan()
             self.assertFalse((store.root / 'a.txt.delete').exists())
+            self.assertIsNone(hidden_marker(self.right, 'a.txt.delete'))
             self.assertEqual(self.manifest_paths(self.right), [])
             self.assertTrue(store.blocked(marker_item))  # a peer still offering it is ignored
             # The name is free again: new content replicates normally.
@@ -442,15 +454,17 @@ class FileReplicationTests(unittest.TestCase):
         self.sync(self.right, self.left)
         (root / 'report.txt').rename(root / 'report.txt.delete')
         self.left.file_store.scan()
-        self.assertIsNotNone(f.marker_created((root / 'report.txt.delete').read_bytes()))
+        self.assertFalse((root / 'report.txt.delete').exists())
+        self.assertIsNotNone(f.marker_created(hidden_marker(self.left, 'report.txt.delete')))
         self.sync(self.right, self.left)
         self.sync(self.left, self.right)
         for node in (self.left, self.right):
             with self.subTest(node=node.identity.port):
                 self.assertFalse((node.file_store.root / 'report.txt').exists())
                 self.assertEqual(self.manifest_paths(node), ['keep.txt', 'report.txt.delete'])
-                # The renamed contents were never shared: every copy is the marker.
-                self.assertNotIn(b'quarterly', (node.file_store.root / 'report.txt.delete').read_bytes())
+                # Both are gone from the folder; only the hidden marker remains, not the contents.
+                self.assertFalse((node.file_store.root / 'report.txt.delete').exists())
+                self.assertNotIn(b'quarterly', hidden_marker(node, 'report.txt.delete'))
 
     def test_renaming_a_folder_to_delete_removes_it_everywhere(self):
         root = self.left.file_store.root
@@ -464,8 +478,8 @@ class FileReplicationTests(unittest.TestCase):
         self.assertTrue((self.right.file_store.root / 'photos/sub/y.jpg').exists())
         (root / 'photos').rename(root / 'photos.delete')
         self.left.file_store.scan()
-        self.assertTrue((root / 'photos.delete').is_file())
-        self.assertIsNotNone(f.marker_created((root / 'photos.delete').read_bytes()))
+        self.assertFalse((root / 'photos.delete').exists())
+        self.assertIsNotNone(f.marker_created(hidden_marker(self.left, 'photos.delete')))
         self.sync(self.right, self.left)
         self.sync(self.left, self.right)
         for node in (self.left, self.right):
@@ -496,6 +510,62 @@ class FileReplicationTests(unittest.TestCase):
                           'photos.delete/extra.txt', 'photos.delete/x.jpg', 'photos/x.jpg',
                           'report.txt', 'report.txt.delete'])
         self.assertEqual((root / 'report.txt.delete').read_bytes(), b'different contents')
+
+    def test_visible_markers_from_older_releases_are_moved_into_hiding(self):
+        # Before hidden markers, a stamped marker lived in the shared folder as an ordinary record.
+        directory = self.root / 'upgraded'
+        (directory / '.peer-sync').mkdir(parents=True)
+        data = f.marker_bytes(int(time.time()))
+        (directory / 'old.txt.delete').write_bytes(data)
+        (directory / 'old.txt').write_bytes(b'should be deleted')
+        item = {'path': 'old.txt.delete', 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+        (directory / '.peer-sync/index.json').write_text(json.dumps(
+            {'version': 1, 'files': [{'file': item, 'destination': 'old.txt.delete'}], 'retired_markers': []}))
+        store = f.FileStore(directory)
+        try:
+            store.scan()
+            self.assertFalse((directory / 'old.txt.delete').exists())
+            self.assertFalse((directory / 'old.txt').exists())
+            self.assertEqual(store.marker_file(item).read_bytes(), data)
+            self.assertEqual([entry['path'] for entry in store.manifest()['files']], ['old.txt.delete'])
+            index = json.loads((directory / '.peer-sync/index.json').read_text())
+            self.assertEqual(index['files'], [])
+            self.assertEqual(index['markers'], [{'file': item}])
+        finally:
+            store.close()
+        reopened = f.FileStore(directory)  # the hidden marker survives a restart
+        try:
+            self.assertEqual(list(reopened.markers.values()), [item])
+        finally:
+            reopened.close()
+
+    def test_missing_hidden_marker_is_dropped_and_fetched_again(self):
+        (self.right.file_store.root / 'x.txt.delete').touch()
+        self.right.file_store.scan()
+        self.sync(self.left, self.right)
+        item = next(i for i in self.left.file_store.markers.values() if i['path'] == 'x.txt.delete')
+        self.left.file_store.marker_file(item).unlink()
+        self.left.file_store.marker_times.clear()
+        self.left.file_store.apply_markers()
+        self.assertEqual(self.left.file_store.markers, {})
+        self.sync(self.left, self.right)
+        self.assertEqual(hidden_marker(self.left, 'x.txt.delete'), hidden_marker(self.right, 'x.txt.delete'))
+
+    def test_delete_delete_still_undoes_a_hidden_marker(self):
+        store = self.left.file_store
+        (store.root / 'keep.txt').write_bytes(b'v1')
+        (store.root / 'keep.txt.delete').touch()
+        store.scan()
+        self.assertFalse((store.root / 'keep.txt').exists())
+        self.assertEqual(store.deleting, ('keep.txt',))
+        (store.root / 'keep.txt.delete.delete').touch()
+        store.scan()
+        self.assertIsNone(hidden_marker(self.left, 'keep.txt.delete'))
+        self.assertEqual(store.deleting, ('keep.txt.delete',))
+        (store.root / 'keep.txt').write_bytes(b'v2')  # the name can be used again at once
+        store.scan()
+        self.assertIn('keep.txt', self.manifest_paths(self.left))
+        self.assertEqual(sorted(p.name for p in store.root.iterdir() if p.is_file()), ['keep.txt'])
 
     def test_index_without_retired_markers_still_loads_and_bad_ones_are_rejected(self):
         for retired, valid in (((), True), ([], True), (['a.txt\0' + 'b' * 64], True),
@@ -621,7 +691,8 @@ class FileReplicationTests(unittest.TestCase):
         self.assertEqual(outcome, 'removed by a .delete marker while downloading')
         self.assertEqual(len(chunks), 4)  # stopped at the first housekeeping after the marker
         self.assertFalse((self.left.file_store.root / 'big.bin').exists())
-        self.assertIsNotNone(f.marker_created((self.left.file_store.root / 'big.bin.delete').read_bytes()))
+        self.assertIsNotNone(f.marker_created(hidden_marker(self.left, 'big.bin.delete')))
+        self.assertFalse((self.left.file_store.root / 'big.bin.delete').exists())
         self.assertIn('added-meanwhile.txt', self.manifest_paths(self.left))
         self.assertEqual(list(self.left.file_store.temp.iterdir()), [])
 
@@ -807,7 +878,8 @@ class LiveDeleteMarkerTests(unittest.TestCase):
                 has = lambda node, name: (node.file_store.root / name).exists()
                 wait_for(lambda: all(has(node, 'doomed.bin') and has(node, 'kept.bin') for node in nodes))
                 (nodes[2].file_store.root / 'doomed.bin.delete').touch()
-                wait_for(lambda: all(not has(node, 'doomed.bin') and has(node, 'doomed.bin.delete')
+                wait_for(lambda: all(not has(node, 'doomed.bin') and not has(node, 'doomed.bin.delete')
+                                     and hidden_marker(node, 'doomed.bin.delete')
                                      for node in nodes))
                 time.sleep(.5)  # Several more sync passes: nothing may bring it back.
                 self.assertFalse(any(has(node, 'doomed.bin') for node in nodes))
@@ -817,7 +889,8 @@ class LiveDeleteMarkerTests(unittest.TestCase):
                 (nodes[0].file_store.root / 'album/a.bin').write_bytes(b'a' * 3000)
                 wait_for(lambda: all(has(node, 'album/a.bin') for node in nodes))
                 (nodes[1].file_store.root / 'album').rename(nodes[1].file_store.root / 'album.delete')
-                wait_for(lambda: all(not has(node, 'album') and (node.file_store.root / 'album.delete').is_file()
+                wait_for(lambda: all(not has(node, 'album') and not has(node, 'album.delete')
+                                     and hidden_marker(node, 'album.delete')
                                      for node in nodes))
                 time.sleep(.5)
                 self.assertFalse(any(has(node, 'album') for node in nodes))
