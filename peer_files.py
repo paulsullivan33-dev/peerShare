@@ -25,6 +25,10 @@ SYNC_INTERVAL_SECONDS = 15
 FULL_VERIFY_SECONDS = 3600
 FILE_DEADLINE_SECONDS = 300
 MAX_DOWNLOADS_PER_PASS = 32
+# One slow or malicious peer must not hold the whole sync pass: each peer gets this much
+# time per pass before the node moves on to the next peer. In-flight downloads are never
+# killed; the budget only stops starting new ones from that peer.
+MAX_PEER_SECONDS_PER_PASS = 120
 # Each node paces its own downloads to at most this many bytes per second, so replication traffic
 # across the whole network stays below (number of nodes) x this. A node can override it, without a
 # restart, in SHARED/.peer-sync/limits.json: {"max_download_bytes_per_second": N} (0 = unlimited).
@@ -45,6 +49,10 @@ MARKER_TTL_SECONDS = 86400
 MAX_MARKER_BYTES = 512
 MAX_RETIRED_MARKERS = 10000
 MARKER_FIELDS = {"peerhandshake-delete", "created", "id"}
+# Quarantine holds bytes replaced by a repair so the operator can inspect them; it is
+# never replicated. Pruned by age and total size on every scan so it cannot grow forever.
+QUARANTINE_TTL_SECONDS = 30 * 86400
+QUARANTINE_MAX_BYTES = 1024**3
 
 
 def logical_path(value: object) -> str:
@@ -401,6 +409,7 @@ class FileStore:
             if changed:
                 self.save()
         self.apply_markers()
+        self.prune_quarantine()
 
     def convert_renames(self, imports: list, records: dict) -> list:
         """Treat a new X.delete that is a renamed (or copied) X as a request to delete X: a file
@@ -637,6 +646,37 @@ class FileStore:
             except OSError:
                 return  # Not empty (or gone): stop here.
 
+    def prune_quarantine(self) -> None:
+        """Drop expired quarantine backups, and the oldest ones past the size cap.
+
+        Quarantine preserves damaged bytes for operator inspection, but nothing ever
+        cleans it otherwise; without this it grows without bound."""
+        directory = self.safe_path(".peer-sync/quarantine", internal=True)
+        try:
+            backups = [(path, path.stat()) for path in directory.iterdir() if path.is_file()]
+        except OSError:
+            return  # Absent or momentarily unreadable; try again on the next scan.
+        now = time.time()
+        fresh = []
+        for path, info in backups:
+            if now - info.st_mtime >= QUARANTINE_TTL_SECONDS:
+                try:
+                    path.unlink()
+                except OSError as error:
+                    self.log(f"could not remove expired quarantine backup {path.name}: {error}")
+            else:
+                fresh.append((path, info))
+        total = sum(info.st_size for _, info in fresh)
+        for path, info in sorted(fresh, key=lambda entry: entry[1].st_mtime):
+            if total <= QUARANTINE_MAX_BYTES:
+                break
+            try:
+                path.unlink()
+                total -= info.st_size
+                self.log(f"quarantine over budget: removed backup {path.name}")
+            except OSError as error:
+                self.log(f"could not remove quarantine backup {path.name}: {error}")
+
     def manifest(self, after: str = "", generation: str | None = None) -> dict:
         with self.lock:
             files = sorted([self.records[identifier]["file"] for identifier in self.intact] +
@@ -801,8 +841,13 @@ class FileReplicator:
         for peer in peers:
             if self.node.stop_event.is_set():
                 return
+            peer_deadline = time.monotonic() + MAX_PEER_SECONDS_PER_PASS
             try:
                 for item in self.remote_manifest(peer):
+                    if time.monotonic() >= peer_deadline:
+                        self.log(f"peer {peer.address()} exceeded the per-pass marker budget; "
+                                 "continuing with the next peer")
+                        break
                     if (marker_target(item["path"]) is None or item["size"] > self.store.max_file_bytes or
                             self.store.has_copy(item) or self.store.blocked(item)):
                         continue
@@ -956,16 +1001,25 @@ class FileReplicator:
             for peer in peers:
                 if self.node.stop_event.is_set():
                     return
+                peer_deadline = time.monotonic() + MAX_PEER_SECONDS_PER_PASS
                 try:
                     manifest = self.remote_manifest(peer)
+                    if time.monotonic() >= peer_deadline:
+                        self.log(f"peer {peer.address()} used its per-pass time on the manifest; "
+                                 "continuing with the next peer")
+                        continue
                     # Delete markers first, so this pass never fetches files a marker removes.
                     markers = [item for item in manifest if marker_target(item["path"]) is not None]
                     others = [item for item in manifest if marker_target(item["path"]) is None]
                     downloaded = 0
+                    cut_short = False
                     for batch in (markers, others):
                         for item in batch:
                             if self.node.stop_event.is_set():
                                 return
+                            if time.monotonic() >= peer_deadline:
+                                cut_short = True
+                                break
                             if (item["size"] > self.store.max_file_bytes or self.store.has_copy(item) or
                                     self.store.blocked(item)):
                                 continue
@@ -979,8 +1033,11 @@ class FileReplicator:
                                 break
                         if batch is markers and markers:
                             self.store.apply_markers()
-                        if downloaded >= MAX_DOWNLOADS_PER_PASS:
+                        if cut_short or downloaded >= MAX_DOWNLOADS_PER_PASS:
                             break
+                    if cut_short:
+                        self.log(f"peer {peer.address()} exceeded the per-pass time budget; "
+                                 "continuing with the next peer")
                 except (OSError, ValueError, TypeError, KeyError) as error:
                     self.log(f"file sync with {peer.address()} failed: {error}")
         finally:

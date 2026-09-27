@@ -114,6 +114,53 @@ class FileReplicationTests(unittest.TestCase):
             self.left.file_replicator.sync_once()
             self.assertEqual(target.read_bytes(), original)
 
+    def test_quarantine_backups_are_pruned_by_age_and_size(self):
+        store = self.left.file_store
+        quarantine = store.state / 'quarantine'
+        quarantine.mkdir(exist_ok=True)
+        aged = quarantine / 'aged.bak'
+        aged.write_bytes(b'x' * 16)
+        ancient = time.time() - (31 * 86400)
+        os.utime(aged, (ancient, ancient))
+        kept = quarantine / 'kept.bak'
+        kept.write_bytes(b'y' * 16)
+        store.prune_quarantine()
+        self.assertFalse(aged.exists())
+        self.assertTrue(kept.exists())
+        now = time.time()
+        os.utime(kept, (now, now + 10))  # Newest: the size cap must evict older ones first.
+        for index, name in enumerate(('first.bak', 'second.bak', 'third.bak')):
+            path = quarantine / name
+            path.write_bytes(b'z' * 16)
+            os.utime(path, (now, now + index))  # Distinct mtimes: first is oldest.
+        with patch.object(f, 'QUARANTINE_MAX_BYTES', 48):
+            store.prune_quarantine()
+        remaining = {path.name for path in quarantine.iterdir()}
+        # kept + 3 x 16 = 64 bytes over a 48-byte cap: the oldest goes first.
+        self.assertEqual(remaining, {'kept.bak', 'second.bak', 'third.bak'})
+
+    def test_slow_peer_does_not_starve_other_peers(self):
+        third = m.PeerNode('127.0.0.1', 9103, None, shared_dir=self.root / 'third')
+        self.addCleanup(third.file_store.close)
+        self.addCleanup(third.stop_event.set)
+        self.left.handle_message(third.message())
+        slow = [{'path': f'slow-{i}.txt', 'sha256': 'a' * 64, 'size': 1} for i in range(50)]
+        fast = [{'path': 'fast.txt', 'sha256': 'b' * 64, 'size': 1}]
+        calls = []
+        def fake_manifest(peer):
+            return list(slow if peer.port == 9102 else fast)
+        def fake_download(peer, item):
+            calls.append(peer.port)
+            time.sleep(0.2)
+        replicator = self.left.file_replicator
+        with patch.object(f.FileReplicator, 'remote_manifest', side_effect=fake_manifest), \
+             patch.object(replicator, 'download', side_effect=fake_download), \
+             patch.object(f, 'MAX_PEER_SECONDS_PER_PASS', 0.5):
+            replicator.sync_once()
+        slow_calls = [port for port in calls if port == 9102]
+        self.assertLess(len(slow_calls), 32)  # The time budget cut it off, not the 32-file cap.
+        self.assertIn(9103, calls)  # The fast peer was still served this pass.
+
     def test_conflicting_versions_converge_without_overwrite_or_new_alias_entries(self):
         (self.left.file_store.root / 'report.txt').write_bytes(b'left version')
         (self.right.file_store.root / 'report.txt').write_bytes(b'right version')
