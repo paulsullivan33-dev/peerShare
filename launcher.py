@@ -435,7 +435,13 @@ class Launcher:
         if not self.stop_event.is_set():
             restored = self.launch_ready(previous)
             if not restored and not self.stop_event.is_set():
-                raise RuntimeError("rollback release also failed to start; inspect application.log")
+                self.fail_release(previous, "rollback release also failed to start")
+                # Stay alive rather than raising: the main health loop retries the
+                # active release with capped exponential backoff, matching the
+                # policy for a release with no earlier release to roll back to.
+                # Exiting here would only force the OS service manager to redo
+                # the same work anyway.
+                log("rollback release also failed to start; retrying with backoff; inspect application.log")
         return False
 
     def next_update(self) -> Path | None:

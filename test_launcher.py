@@ -60,6 +60,17 @@ class ReleaseTests(unittest.TestCase):
         finally:
             supervisor.stop_child()
 
+    def test_failed_update_and_failed_rollback_keep_launcher_alive(self):
+        root = self.installation()
+        supervisor = launch.Launcher(root)
+        update = self.make_package(2)
+        with patch.object(launch.Launcher, 'launch_ready', return_value=False):
+            self.assertFalse(supervisor.apply_update(update))  # must not raise
+        self.assertEqual(supervisor.state['active'], 1)
+        self.assertIsNone(supervisor.state['pending'])
+        self.assertIn('2', supervisor.state['failed'])
+        self.assertIn('1', supervisor.state['failed'])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary.name)
